@@ -62,11 +62,11 @@ jobs:
           Start-Process -FilePath $exe -ArgumentList @("tcp","3389","--region","cn_top","--log","stdout") -RedirectStandardOutput $outLog -RedirectStandardError $errLog -WindowStyle Hidden
           function Get-PublicTcpUrl([string]$text) {
             if (-not $text) { return $null }
-            $ms = [regex]::Matches($text, "tcp://([a-zA-Z0-9._-]+):(\d+)")
+            $ms = [regex]::Matches($text, "(?:tcp://)?((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}):(\d{2,5})")
             foreach ($m in $ms) {
-              $h = $m.Groups[1].Value
-              if ($h -eq "127.0.0.1" -or $h -eq "localhost") { continue }
-              return $m.Value
+              $h = $m.Groups[1].Value.ToLower()
+              if ($h -match "^(127\.|localhost|0\.0\.0\.0)") { continue }
+              return "tcp://$($m.Groups[1].Value):$($m.Groups[2].Value)"
             }
             return $null
           }
@@ -75,12 +75,10 @@ jobs:
             Start-Sleep -Seconds 3
             try {
               $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
-              foreach ($t in @($j.tunnels)) {
-                $cand = Get-PublicTcpUrl ([string]$t.public_url)
-                if ($cand) { $pub = $cand; break }
-              }
+              $blob = ($j | ConvertTo-Json -Depth 8)
+              $cand = Get-PublicTcpUrl $blob
+              if ($cand) { $pub = $cand; break }
             } catch {}
-            if ($pub) { break }
             $txt = ""
             if (Test-Path $outLog) { $txt += (Get-Content $outLog -Raw -ErrorAction SilentlyContinue) }
             if (Test-Path $errLog) { $txt += (Get-Content $errLog -Raw -ErrorAction SilentlyContinue) }
