@@ -60,23 +60,32 @@ jobs:
           $outLog = Join-Path $env:RUNNER_TEMP "cpolar.out.log"
           $errLog = Join-Path $env:RUNNER_TEMP "cpolar.err.log"
           Start-Process -FilePath $exe -ArgumentList @("tcp","3389","--region","cn_top","--log","stdout") -RedirectStandardOutput $outLog -RedirectStandardError $errLog -WindowStyle Hidden
+          function Get-PublicTcpUrl([string]$text) {
+            if (-not $text) { return $null }
+            $ms = [regex]::Matches($text, "tcp://([a-zA-Z0-9._-]+):(\d+)")
+            foreach ($m in $ms) {
+              $h = $m.Groups[1].Value
+              if ($h -eq "127.0.0.1" -or $h -eq "localhost") { continue }
+              return $m.Value
+            }
+            return $null
+          }
           $pub = $null
           for ($i = 0; $i -lt 40; $i++) {
             Start-Sleep -Seconds 3
             try {
               $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
-              if ($j.tunnels -and $j.tunnels.Count -gt 0) {
-                $pub = $j.tunnels[0].public_url
-                if ($pub) { break }
+              foreach ($t in @($j.tunnels)) {
+                $cand = Get-PublicTcpUrl ([string]$t.public_url)
+                if ($cand) { $pub = $cand; break }
               }
             } catch {}
+            if ($pub) { break }
             $txt = ""
             if (Test-Path $outLog) { $txt += (Get-Content $outLog -Raw -ErrorAction SilentlyContinue) }
             if (Test-Path $errLog) { $txt += (Get-Content $errLog -Raw -ErrorAction SilentlyContinue) }
-            if ($txt -match "tcp://([a-zA-Z0-9._-]+):(\d+)") {
-              $pub = "tcp://$($Matches[1]):$($Matches[2])"
-              break
-            }
+            $cand = Get-PublicTcpUrl $txt
+            if ($cand) { $pub = $cand; break }
           }
           if (-not $pub) {
             Write-Host "----- cpolar.out.log -----"
