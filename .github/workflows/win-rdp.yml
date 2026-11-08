@@ -60,13 +60,21 @@ jobs:
           $outLog = Join-Path $env:RUNNER_TEMP "cpolar.out.log"
           $errLog = Join-Path $env:RUNNER_TEMP "cpolar.err.log"
           Start-Process -FilePath $exe -ArgumentList @("tcp","3389","--region","cn_top","--log","stdout") -RedirectStandardOutput $outLog -RedirectStandardError $errLog -WindowStyle Hidden
+          function Test-RdpTunnelUrl([string]$h, [string]$p) {
+            if (-not $h -or -not $p) { return $false }
+            $hl = $h.ToLower()
+            if ($hl -match "cpolard|localhost|127\.|0\.0\.0\.0") { return $false }
+            if ($p -in @("80","443","4443","4040","8080","8443")) { return $false }
+            if ($hl -notmatch "cpolar") { return $false }
+            return $true
+          }
           function Get-PublicTcpUrl([string]$text) {
             if (-not $text) { return $null }
-            $ms = [regex]::Matches($text, "(?:tcp://)?((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}):(\d{2,5})")
+            $ms = [regex]::Matches($text, "(?:tcp://)?((?:[a-zA-Z0-9-]+\.)*(?:tcp\.)?(?:vip\.)?cpolar\.(?:top|cn|com)):(\d{2,5})")
             foreach ($m in $ms) {
-              $h = $m.Groups[1].Value.ToLower()
-              if ($h -match "^(127\.|localhost|0\.0\.0\.0)") { continue }
-              return "tcp://$($m.Groups[1].Value):$($m.Groups[2].Value)"
+              if (Test-RdpTunnelUrl $m.Groups[1].Value $m.Groups[2].Value) {
+                return "tcp://$($m.Groups[1].Value):$($m.Groups[2].Value)"
+              }
             }
             return $null
           }
@@ -75,10 +83,17 @@ jobs:
             Start-Sleep -Seconds 3
             try {
               $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
-              $blob = ($j | ConvertTo-Json -Depth 8)
-              $cand = Get-PublicTcpUrl $blob
-              if ($cand) { $pub = $cand; break }
+              foreach ($t in @($j.tunnels)) {
+                $u = [string]$t.public_url
+                $cand = Get-PublicTcpUrl $u
+                if ($cand) { $pub = $cand; break }
+              }
+              if (-not $pub) {
+                $cand = Get-PublicTcpUrl ($j | ConvertTo-Json -Depth 8)
+                if ($cand) { $pub = $cand }
+              }
             } catch {}
+            if ($pub) { break }
             $txt = ""
             if (Test-Path $outLog) { $txt += (Get-Content $outLog -Raw -ErrorAction SilentlyContinue) }
             if (Test-Path $errLog) { $txt += (Get-Content $errLog -Raw -ErrorAction SilentlyContinue) }
