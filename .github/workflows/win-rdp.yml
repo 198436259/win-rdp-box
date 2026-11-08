@@ -57,15 +57,15 @@ jobs:
           $exe = Get-ChildItem $dir -Recurse -Filter "cpolar.exe" | Select-Object -First 1 -ExpandProperty FullName
           if (-not $exe) { throw "cpolar.exe not found in zip" }
           $cfg = Join-Path $dir "rdp.yml"
-          @"
-authtoken: $($env:CPOLAR_AUTHTOKEN)
-tunnels:
-  rdp:
-    proto: tcp
-    addr: 3389
-    region: hk
-    inspect: false
-"@ | Set-Content -Path $cfg -Encoding ASCII
+          @(
+            "authtoken: $($env:CPOLAR_AUTHTOKEN)"
+            "tunnels:"
+            "  rdp:"
+            "    proto: tcp"
+            "    addr: 3389"
+            "    region: hk"
+            "    inspect: false"
+          ) | Set-Content -Path $cfg -Encoding ASCII
           $outLog = Join-Path $env:RUNNER_TEMP "cpolar.out.log"
           $errLog = Join-Path $env:RUNNER_TEMP "cpolar.err.log"
           Start-Process -FilePath $exe -ArgumentList @("start","rdp","-config",$cfg,"--log","stdout") -RedirectStandardOutput $outLog -RedirectStandardError $errLog -WindowStyle Hidden
