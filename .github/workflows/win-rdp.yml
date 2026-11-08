@@ -1,0 +1,166 @@
+name: win-rdp
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  box:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: enable rdp
+        shell: powershell
+        env:
+          RDP_PASS: ${{ secrets.RDP_PASS }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pw = $env:RDP_PASS
+          if (-not $pw) { $pw = "Runner123" }
+          net user runneradmin $pw
+          if ($LASTEXITCODE -ne 0) { throw "net user failed: $LASTEXITCODE" }
+          net localgroup administrators runneradmin /add
+          net localgroup "Remote Desktop Users" runneradmin /add
+          "RDP_PASS=$pw" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "::notice::RESULT-PASS=$pw"
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fSingleSessionPerUser" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "UserAuthentication" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          New-NetFirewallRule -DisplayName "RDP-3389-in" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service TermService -Force
+          Start-Sleep -Seconds 3
+          netstat -an | findstr ":3389"
+          Write-Host "rdp enabled nla=off securitylayer=rdp"
+
+      - name: ngrok tcp 3389
+        shell: powershell
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
+          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:NGROK_AUTHTOKEN) { throw "NGROK_AUTHTOKEN secret missing" }
+          if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
+          $zip = Join-Path $env:RUNNER_TEMP "ngrok.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "ngrok"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $ngrok = Join-Path $dir "ngrok.exe"
+          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+          Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
+          $pub = $null
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 3
+            try {
+              $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
+              if ($j.tunnels -and $j.tunnels.Count -gt 0) {
+                $pub = $j.tunnels[0].public_url
+                if ($pub) { break }
+              }
+            } catch {}
+          }
+          if (-not $pub -and (Test-Path $log)) {
+            Write-Host "----- ngrok.log -----"
+            Get-Content $log -ErrorAction SilentlyContinue
+          }
+          $status = "ready"
+          $rdpHost = ""
+          $rdpPort = ""
+          if (-not $pub) {
+            $status = "ngrok-no-url"
+          } else {
+            if ($pub -match "tcp://([^:]+):(\d+)") {
+              $rdpHost = $Matches[1]
+              $rdpPort = $Matches[2]
+            } else {
+              $status = "ngrok-bad-url"
+            }
+          }
+          Write-Host "tunnel status=$status"
+          $body = "status=$status`nhost=$rdpHost`nport=$rdpPort`npass=$env:RDP_PASS`nurl=$pub`n"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+          $path = ".box/$($env:GITHUB_RUN_ID).txt"
+          $payload = (@{ message = "box $($env:GITHUB_RUN_ID)"; content = $b64 } | ConvertTo-Json -Compress)
+          $payloadFile = Join-Path $env:RUNNER_TEMP "box.json"
+          [IO.File]::WriteAllText($payloadFile, $payload)
+          if ($env:GITHUB_TOKEN) {
+            $httpCode = & curl.exe -sS -o "$env:RUNNER_TEMP\box-resp.txt" -w "%{http_code}" -X PUT `
+              -H "Authorization: Bearer $($env:GITHUB_TOKEN)" `
+              -H "Accept: application/vnd.github+json" `
+              -H "X-GitHub-Api-Version: 2022-11-28" `
+              -H "Content-Type: application/json" `
+              --data-binary "@$payloadFile" `
+              "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/$path"
+            Write-Host "report http=$httpCode repo=$($env:SNAPSHOT_REPO)"
+          } else {
+            Write-Host "GITHUB_TOKEN empty, skip report"
+          }
+          if ($status -ne "ready") { throw "tunnel not ready: $status" }
+
+      - name: restore C snapshot
+        continue-on-error: true
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
+          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+        run: |
+          if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore
+          $src = "$env:USERPROFILE\win-rdp-src"
+          New-Item -ItemType Directory -Force -Path "$src\scripts" | Out-Null
+          Copy-Item -Recurse -Force .\scripts\* "$src\scripts"
+          @{
+            GITHUB_TOKEN      = $env:GITHUB_TOKEN
+            GITHUB_REPOSITORY = $env:SNAPSHOT_REPO
+            SNAPSHOT_REPO     = $env:SNAPSHOT_REPO
+          } | ConvertTo-Json | Set-Content -Path "$src\env.json" -Encoding UTF8
+          icacls "$src\env.json" /inheritance:r /grant:r "${env:USERNAME}:(R,W)" | Out-Null
+          Copy-Item -Force "$src\scripts\save-desktop.ps1" "$env:USERPROFILE\Desktop\save-image.ps1"
+          Copy-Item -Force "$src\scripts\C-IMAGE.txt" "$env:USERPROFILE\Desktop\c-image.txt"
+          $ws = New-Object -ComObject WScript.Shell
+          $sc = $ws.CreateShortcut("$env:USERPROFILE\Desktop\save-image.lnk")
+          $sc.TargetPath = "powershell.exe"
+          $sc.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$env:USERPROFILE\Desktop\save-image.ps1`""
+          $sc.WorkingDirectory = $src
+          $sc.WindowStyle = 1
+          $sc.Save()
+          Write-Host "desktop save shortcut created"
+
+      - name: keep alive
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
+          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+        run: |
+          if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
+          Write-Host "keepalive start"
+          $deadline = (Get-Date).AddMinutes(350)
+          $nextSave = (Get-Date).AddMinutes(60)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 60
+            if ((Get-Date) -ge $nextSave) {
+              Write-Host "periodic save $((Get-Date).ToString('o'))"
+              try {
+                powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save
+              } catch {
+                Write-Host "periodic save failed: $_"
+              }
+              $nextSave = (Get-Date).AddMinutes(60)
+            }
+          }
+          Write-Host "auto-save before timeout"
+          try {
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save
+          } catch {
+            Write-Host "auto-save failed: $_"
+          }

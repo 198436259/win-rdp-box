@@ -1,0 +1,11 @@
+GitHub hosted windows-latest is not a full-disk snapshot.
+
+Saved (C: user-state delta):
+- Desktop / Documents / Downloads, common AppData, user install dir
+- HKCU keys and user environment variables
+- Claude / Codex login dirs as a separate layer
+
+Not saved: temp disk, the OS itself, GitHub token (env.json is excluded).
+
+Use: install apps, log into Claude, then double-click Desktop "Save image".
+Next win-rdp run restores on boot. First run skips restore if the Release is empty.
