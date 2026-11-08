@@ -52,7 +52,17 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP "cpolar.zip"
           $dir = Join-Path $env:RUNNER_TEMP "cpolar"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          & curl.exe -fsSL -o $zip "https://www.cpolar.com/static/downloads/cpolar-stable-windows-amd64.zip"
+          $urls = @(
+            "https://www.cpolar.com/static/downloads/cpolar-stable-windows-amd64.zip",
+            "https://static.cpolar.com/downloads/cpolar-stable-windows-amd64.zip"
+          )
+          $got = $false
+          foreach ($u in $urls) {
+            Write-Host "download $u"
+            & curl.exe -fL --retry 3 --retry-delay 2 -o $zip $u
+            if ((Test-Path $zip) -and ((Get-Item $zip).Length -gt 1000000)) { $got = $true; break }
+          }
+          if (-not $got) { throw "cpolar zip download failed" }
           Expand-Archive -Path $zip -DestinationPath $dir -Force
           $exe = Get-ChildItem $dir -Recurse -Filter "cpolar.exe" | Select-Object -First 1 -ExpandProperty FullName
           if (-not $exe) { throw "cpolar.exe not found in zip" }
