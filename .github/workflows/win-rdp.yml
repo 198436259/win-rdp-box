@@ -24,7 +24,7 @@ jobs:
           net localgroup administrators runneradmin /add
           net localgroup "Remote Desktop Users" runneradmin /add
           "RDP_PASS=$pw" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "::notice::RESULT-PASS=$pw"
+          Write-Host "rdp password set"
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fSingleSessionPerUser" -Value 0
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
@@ -39,25 +39,26 @@ jobs:
           netstat -an | findstr ":3389"
           Write-Host "rdp enabled nla=off securitylayer=rdp"
 
-      - name: ngrok tcp 3389
+      - name: cpolar tcp 3389
         shell: powershell
         env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          CPOLAR_AUTHTOKEN: ${{ secrets.CPOLAR_AUTHTOKEN }}
           GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
           SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
         run: |
           $ErrorActionPreference = "Stop"
-          if (-not $env:NGROK_AUTHTOKEN) { throw "NGROK_AUTHTOKEN secret missing" }
+          if (-not $env:CPOLAR_AUTHTOKEN) { throw "CPOLAR_AUTHTOKEN secret missing" }
           if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
-          $zip = Join-Path $env:RUNNER_TEMP "ngrok.zip"
-          $dir = Join-Path $env:RUNNER_TEMP "ngrok"
+          $zip = Join-Path $env:RUNNER_TEMP "cpolar.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "cpolar"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile $zip
+          & curl.exe -fsSL -o $zip "https://www.cpolar.com/static/downloads/cpolar-stable-windows-amd64.zip"
           Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $ngrok = Join-Path $dir "ngrok.exe"
-          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
-          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
-          Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
+          $exe = Get-ChildItem $dir -Recurse -Filter "cpolar.exe" | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw "cpolar.exe not found in zip" }
+          & $exe authtoken $env:CPOLAR_AUTHTOKEN
+          $log = Join-Path $env:RUNNER_TEMP "cpolar.log"
+          Start-Process -FilePath $exe -ArgumentList @("tcp","3389","--region","cn_top","--log","stdout") -RedirectStandardOutput $log -RedirectStandardError $log -WindowStyle Hidden
           $pub = $null
           for ($i = 0; $i -lt 40; $i++) {
             Start-Sleep -Seconds 3
@@ -68,22 +69,29 @@ jobs:
                 if ($pub) { break }
               }
             } catch {}
+            if (Test-Path $log) {
+              $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
+              if ($txt -match "tcp://([a-zA-Z0-9._-]+):(\d+)") {
+                $pub = "tcp://$($Matches[1]):$($Matches[2])"
+                break
+              }
+            }
           }
           if (-not $pub -and (Test-Path $log)) {
-            Write-Host "----- ngrok.log -----"
-            Get-Content $log -ErrorAction SilentlyContinue
+            Write-Host "----- cpolar.log -----"
+            Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 40
           }
           $status = "ready"
           $rdpHost = ""
           $rdpPort = ""
           if (-not $pub) {
-            $status = "ngrok-no-url"
+            $status = "cpolar-no-url"
           } else {
             if ($pub -match "tcp://([^:]+):(\d+)") {
               $rdpHost = $Matches[1]
               $rdpPort = $Matches[2]
             } else {
-              $status = "ngrok-bad-url"
+              $status = "cpolar-bad-url"
             }
           }
           Write-Host "tunnel status=$status"
