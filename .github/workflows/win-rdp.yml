@@ -79,7 +79,7 @@ jobs:
           }
           function Get-PublicTcpUrl([string]$text) {
             if (-not $text) { return $null }
-            $ms = [regex]::Matches($text, "(?:tcp://)?((?:[a-zA-Z0-9-]+\.)*(?:tcp\.)?(?:vip\.)?cpolar\.(?:top|cn|com)):(\d{2,5})")
+            $ms = [regex]::Matches($text, "(?:tcp://)?((?:[a-zA-Z0-9-]+\.)*cpolar\.(?:top|cn|com|io)):(\d{2,5})")
             foreach ($m in $ms) {
               if (Test-RdpTunnelUrl $m.Groups[1].Value $m.Groups[2].Value) {
                 return "tcp://$($m.Groups[1].Value):$($m.Groups[2].Value)"
