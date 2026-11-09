@@ -5,9 +5,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Vhd = "D:\e.vhdx"
 $Label = "persist"
 $Letter = "E"
+
+function Get-VhdPath {
+  if (Test-Path "D:\") { return "D:\e.vhdx" }
+  $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+  New-Item -ItemType Directory -Force -Path $root | Out-Null
+  Write-Host "e-disk: D: missing, using $root\e.vhdx"
+  return (Join-Path $root "e.vhdx")
+}
+
+$Vhd = Get-VhdPath
 
 function Get-RcloneExe {
   $dir = Join-Path $env:RUNNER_TEMP "rclone"
@@ -98,34 +107,79 @@ function Set-Letter([object]$vol) {
     Set-Partition -NewDriveLetter $Letter
 }
 
+function Invoke-DiskpartAttach {
+  $script = @"
+select vdisk file="$Vhd"
+attach vdisk
+"@
+  $tmp = Join-Path $env:TEMP "e-disk-attach.txt"
+  [IO.File]::WriteAllText($tmp, $script)
+  Write-Host "e-disk: diskpart attach"
+  $out = & diskpart.exe /s $tmp 2>&1 | Out-String
+  Write-Host $out
+}
+
 function Mount-Persist {
-  $img = Mount-DiskImage -ImagePath $Vhd -PassThru
-  $disk = $img | Get-Disk
-  $raw = [string]$disk.PartitionStyle
-  Write-Host ("e-disk: disk#={0} style={1} size={2}" -f $disk.Number, $raw, $disk.Size)
-  if ($raw -eq "RAW" -or $raw -eq "") {
-    Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru |
-      New-Partition -UseMaximumSize -DriveLetter $Letter |
-      Format-Volume -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false | Out-Null
-    return
-  }
-  $vol = Wait-PersistVolume $disk.Number
-  if ($vol) {
-    Set-Letter $vol
-    return
-  }
-  $part = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
-    Where-Object { $_.Type -eq "Basic" -or $_.Size -gt 8MB } |
-    Select-Object -First 1
-  if ($part) {
-    if (-not $part.DriveLetter) {
-      $part | Set-Partition -NewDriveLetter $Letter
-    } elseif ($part.DriveLetter -ne $Letter) {
-      Set-Partition -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber -NewDriveLetter $Letter
+  Write-Host "e-disk: volumes before mount"
+  Get-Volume | Format-Table DriveLetter, FileSystemLabel, FileSystem, Size -AutoSize | Out-String | Write-Host
+  $attached = $false
+  try {
+    $img = Mount-DiskImage -ImagePath $Vhd -PassThru -ErrorAction Stop
+    $attached = $true
+    Write-Host "e-disk: Mount-DiskImage ok"
+  } catch {
+    Write-Host "e-disk: Mount-DiskImage failed: $_"
+    try {
+      Import-Module Hyper-V -ErrorAction SilentlyContinue
+      Mount-VHD -Path $Vhd -ErrorAction Stop
+      $attached = $true
+      Write-Host "e-disk: Mount-VHD ok"
+    } catch {
+      Write-Host "e-disk: Mount-VHD failed: $_"
+      Invoke-DiskpartAttach
+      $attached = $true
     }
-    return
   }
-  throw ("e-disk: mounted but no persist volume disk#={0} style={1}" -f $disk.Number, $raw)
+  Start-Sleep -Seconds 2
+  try { Update-HostStorageCache } catch {}
+  $disk = Get-Disk | Where-Object {
+    $_.Location -like "*e.vhdx*" -or $_.FriendlyName -match "Virtual"
+  } | Sort-Object Number -Descending | Select-Object -First 1
+  if (-not $disk) {
+    $disk = Get-DiskImage -ImagePath $Vhd -ErrorAction SilentlyContinue | Get-Disk -ErrorAction SilentlyContinue
+  }
+  if ($disk) {
+    Write-Host ("e-disk: disk#={0} style={1} size={2} name={3}" -f $disk.Number, $disk.PartitionStyle, $disk.Size, $disk.FriendlyName)
+    $raw = [string]$disk.PartitionStyle
+    if ($raw -eq "RAW") {
+      Write-Host "e-disk: RAW disk, initializing (new empty VHD only)"
+      Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru |
+        New-Partition -UseMaximumSize -DriveLetter $Letter |
+        Format-Volume -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false | Out-Null
+      return
+    }
+    $vol = Wait-PersistVolume $disk.Number
+    if ($vol) {
+      Set-Letter $vol
+      return
+    }
+    $part = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+      Where-Object { $_.Type -eq "Basic" -or $_.Size -gt 8MB } |
+      Select-Object -First 1
+    if ($part) {
+      Write-Host ("e-disk: partition type={0} letter={1} size={2}" -f $part.Type, $part.DriveLetter, $part.Size)
+      if (-not $part.DriveLetter) {
+        $part | Set-Partition -NewDriveLetter $Letter
+      } elseif ($part.DriveLetter -ne $Letter) {
+        Set-Partition -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber -NewDriveLetter $Letter
+      }
+      return
+    }
+  }
+  Write-Host "e-disk: volumes after mount"
+  Get-Volume | Format-Table DriveLetter, FileSystemLabel, FileSystem, Size -AutoSize | Out-String | Write-Host
+  Get-Partition | Format-Table DiskNumber, DriveLetter, Size, Type -AutoSize | Out-String | Write-Host
+  throw ("e-disk: mounted={0} but E: not assigned" -f $attached)
 }
 
 function Invoke-Mount {
