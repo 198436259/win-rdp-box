@@ -47,11 +47,24 @@ function Get-OssVhd {
   return "oss:$($env:OSS_BUCKET)/e.vhdx"
 }
 
+function Test-Sparse([string]$path) {
+  if (-not (Test-Path $path)) { return $false }
+  $out = & fsutil.exe sparse queryflag $path 2>&1 | Out-String
+  Write-Host ("e-disk: sparse query: " + $out.Trim())
+  return ($out -match "is set")
+}
+
 function ConvertTo-Nonsparse([string]$path) {
   if (-not (Test-Path $path)) { return }
+  if (-not (Test-Sparse $path)) {
+    Write-Host "e-disk: already non-sparse, skip copy"
+    return
+  }
   $tmp = Join-Path (Split-Path $path) ("nonsparse-" + [IO.Path]::GetFileName($path))
   Write-Host "e-disk: copying to non-sparse $tmp"
+  $t0 = Get-Date
   & cmd.exe /c "copy /y `"$path`" `"$tmp`""
+  Write-Host ("e-disk: nonsparse copy seconds={0:N1}" -f ((Get-Date) - $t0).TotalSeconds)
   if (-not (Test-Path $tmp) -or ((Get-Item $tmp).Length -lt 1MB)) {
     throw "e-disk: non-sparse copy failed"
   }
