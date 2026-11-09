@@ -39,64 +39,26 @@ jobs:
           netstat -an | findstr ":3389"
           Write-Host "rdp enabled nla=off securitylayer=rdp"
 
-      - name: cpolar tcp 3389
+      - name: ngrok tcp 3389
         shell: powershell
         env:
-          CPOLAR_AUTHTOKEN: ${{ secrets.CPOLAR_AUTHTOKEN }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
           GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
           SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
         run: |
           $ErrorActionPreference = "Stop"
-          if (-not $env:CPOLAR_AUTHTOKEN) { throw "CPOLAR_AUTHTOKEN secret missing" }
+          if (-not $env:NGROK_AUTHTOKEN) { throw "NGROK_AUTHTOKEN secret missing" }
           if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
-          $zip = Join-Path $env:RUNNER_TEMP "cpolar.zip"
-          $dir = Join-Path $env:RUNNER_TEMP "cpolar"
+          $zip = Join-Path $env:RUNNER_TEMP "ngrok.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "ngrok"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          $urls = @(
-            "https://www.cpolar.com/static/downloads/cpolar-stable-windows-amd64.zip",
-            "https://static.cpolar.com/downloads/cpolar-stable-windows-amd64.zip"
-          )
-          $got = $false
-          foreach ($u in $urls) {
-            Write-Host "download $u"
-            & curl.exe -fL --retry 3 --retry-delay 2 -o $zip $u
-            if ((Test-Path $zip) -and ((Get-Item $zip).Length -gt 1000000)) { $got = $true; break }
-          }
-          if (-not $got) { throw "cpolar zip download failed" }
+          curl.exe -fsSL -o $zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          if (-not (Test-Path $zip) -or ((Get-Item $zip).Length -lt 1000000)) { throw "ngrok zip download failed" }
           Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $exe = Get-ChildItem $dir -Recurse -Filter "cpolar.exe" | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $exe) { throw "cpolar.exe not found in zip" }
-          $cfg = Join-Path $dir "rdp.yml"
-          @(
-            "authtoken: $($env:CPOLAR_AUTHTOKEN)"
-            "tunnels:"
-            "  rdp:"
-            "    proto: tcp"
-            "    addr: 3389"
-            "    region: hk"
-            "    inspect: false"
-          ) | Set-Content -Path $cfg -Encoding ASCII
-          $outLog = Join-Path $env:RUNNER_TEMP "cpolar.out.log"
-          $errLog = Join-Path $env:RUNNER_TEMP "cpolar.err.log"
-          Start-Process -FilePath $exe -ArgumentList @("start","rdp","-config",$cfg,"--log","stdout") -RedirectStandardOutput $outLog -RedirectStandardError $errLog -WindowStyle Hidden
-          function Test-RdpTunnelUrl([string]$h, [string]$p) {
-            if (-not $h -or -not $p) { return $false }
-            $hl = $h.ToLower()
-            if ($hl -match "cpolard|localhost|127\.|0\.0\.0\.0") { return $false }
-            if ($p -in @("80","443","4443","4040","8080","8443")) { return $false }
-            if ($hl -notmatch "cpolar") { return $false }
-            return $true
-          }
-          function Get-PublicTcpUrl([string]$text) {
-            if (-not $text) { return $null }
-            $ms = [regex]::Matches($text, "(?:tcp://)?((?:[a-zA-Z0-9-]+\.)*cpolar\.(?:top|cn|com|io)):(\d{2,5})")
-            foreach ($m in $ms) {
-              if (Test-RdpTunnelUrl $m.Groups[1].Value $m.Groups[2].Value) {
-                return "tcp://$($m.Groups[1].Value):$($m.Groups[2].Value)"
-              }
-            }
-            return $null
-          }
+          $ngrok = Join-Path $dir "ngrok.exe"
+          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+          Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
           $pub = $null
           for ($i = 0; $i -lt 40; $i++) {
             Start-Sleep -Seconds 3
@@ -104,39 +66,25 @@ jobs:
               $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
               foreach ($t in @($j.tunnels)) {
                 $u = [string]$t.public_url
-                $cand = Get-PublicTcpUrl $u
-                if ($cand) { $pub = $cand; break }
-              }
-              if (-not $pub) {
-                $cand = Get-PublicTcpUrl ($j | ConvertTo-Json -Depth 8)
-                if ($cand) { $pub = $cand }
+                if ($u -match "^tcp://") { $pub = $u; break }
               }
             } catch {}
             if ($pub) { break }
-            $txt = ""
-            if (Test-Path $outLog) { $txt += (Get-Content $outLog -Raw -ErrorAction SilentlyContinue) }
-            if (Test-Path $errLog) { $txt += (Get-Content $errLog -Raw -ErrorAction SilentlyContinue) }
-            $cand = Get-PublicTcpUrl $txt
-            if ($cand) { $pub = $cand; break }
           }
-          if (-not $pub) {
-            Write-Host "----- cpolar.out.log -----"
-            Get-Content $outLog -ErrorAction SilentlyContinue | Select-Object -First 40
-            Write-Host "----- cpolar.err.log -----"
-            Get-Content $errLog -ErrorAction SilentlyContinue | Select-Object -First 40
+          if (-not $pub -and (Test-Path $log)) {
+            Write-Host "----- ngrok.log -----"
+            Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 40
           }
           $status = "ready"
           $rdpHost = ""
           $rdpPort = ""
           if (-not $pub) {
-            $status = "cpolar-no-url"
+            $status = "ngrok-no-url"
+          } elseif ($pub -match "tcp://([^:]+):(\d+)") {
+            $rdpHost = $Matches[1]
+            $rdpPort = $Matches[2]
           } else {
-            if ($pub -match "tcp://([^:]+):(\d+)") {
-              $rdpHost = $Matches[1]
-              $rdpPort = $Matches[2]
-            } else {
-              $status = "cpolar-bad-url"
-            }
+            $status = "ngrok-bad-url"
           }
           Write-Host "tunnel status=$status"
           $body = "status=$status`nhost=$rdpHost`nport=$rdpPort`npass=$env:RDP_PASS`nurl=$pub`n"
