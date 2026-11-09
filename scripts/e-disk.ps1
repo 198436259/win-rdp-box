@@ -65,39 +65,82 @@ function Invoke-Rclone {
   }
 }
 
+function Wait-PersistVolume([int]$diskNumber) {
+  for ($i = 0; $i -lt 20; $i++) {
+    $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq $Label } | Select-Object -First 1
+    if ($vol) { return $vol }
+    $part = Get-Partition -DiskNumber $diskNumber -ErrorAction SilentlyContinue |
+      Where-Object { $_.Type -eq "Basic" -or $_.Size -gt 8MB } |
+      Select-Object -First 1
+    if ($part) {
+      try { $v = $part | Get-Volume -ErrorAction SilentlyContinue } catch { $v = $null }
+      if ($v) { return $v }
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  return $null
+}
+
+function Set-Letter([object]$vol) {
+  if (-not $vol) { return }
+  $cur = [string]$vol.DriveLetter
+  if ($cur -eq $Letter) { return }
+  if ($cur) {
+    Get-Partition -DriveLetter $cur | Set-Partition -NewDriveLetter $Letter
+    return
+  }
+  $diskNumber = $null
+  try { $diskNumber = (Get-Partition -Volume $vol).DiskNumber } catch {}
+  if ($null -eq $diskNumber) { return }
+  Get-Partition -DiskNumber $diskNumber |
+    Where-Object { $_.Type -eq "Basic" -or $_.Size -gt 8MB } |
+    Select-Object -First 1 |
+    Set-Partition -NewDriveLetter $Letter
+}
+
 function Mount-Persist {
   $img = Mount-DiskImage -ImagePath $Vhd -PassThru
-  $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq $Label } | Select-Object -First 1
-  if (-not $vol) {
-    $disk = $img | Get-Disk
+  $disk = $img | Get-Disk
+  $raw = [string]$disk.PartitionStyle
+  Write-Host ("e-disk: disk#={0} style={1} size={2}" -f $disk.Number, $raw, $disk.Size)
+  if ($raw -eq "RAW" -or $raw -eq "") {
     Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru |
       New-Partition -UseMaximumSize -DriveLetter $Letter |
       Format-Volume -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false | Out-Null
     return
   }
-  if ($vol.DriveLetter -ne $Letter) {
-    if ($vol.DriveLetter) {
-      Get-Partition -DriveLetter $vol.DriveLetter | Set-Partition -NewDriveLetter $Letter
-    } else {
-      Get-Disk -Number ($img | Get-Disk).Number | Get-Partition |
-        Where-Object { $_.Type -eq "Basic" } |
-        Set-Partition -NewDriveLetter $Letter
-    }
+  $vol = Wait-PersistVolume $disk.Number
+  if ($vol) {
+    Set-Letter $vol
+    return
   }
+  $part = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+    Where-Object { $_.Type -eq "Basic" -or $_.Size -gt 8MB } |
+    Select-Object -First 1
+  if ($part) {
+    if (-not $part.DriveLetter) {
+      $part | Set-Partition -NewDriveLetter $Letter
+    } elseif ($part.DriveLetter -ne $Letter) {
+      Set-Partition -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber -NewDriveLetter $Letter
+    }
+    return
+  }
+  throw ("e-disk: mounted but no persist volume disk#={0} style={1}" -f $disk.Number, $raw)
 }
 
 function Invoke-Mount {
   Set-RcloneOssEnv
   $remote = Get-OssVhd
-  $listed = Invoke-Rclone @("lsf", "oss:$($env:OSS_BUCKET)/", "--include", "e.vhdx")
-  $has = $false
-  foreach ($line in @($listed)) {
-    if (([string]$line).Trim() -match "^e\.vhdx$") { $has = $true }
-  }
-  if ($has) {
-    Write-Host "e-disk: downloading e.vhdx"
+  if (Test-Path $Vhd) { Remove-Item $Vhd -Force }
+  Write-Host "e-disk: trying download e.vhdx"
+  $got = $false
+  try {
     Invoke-Rclone @("copy", $remote, "D:\", "--progress") | Out-Null
-    if (-not (Test-Path $Vhd)) { throw "e.vhdx not downloaded" }
+    if ((Test-Path $Vhd) -and ((Get-Item $Vhd).Length -gt 1MB)) { $got = $true }
+  } catch {
+    Write-Host "e-disk: download failed: $_"
+  }
+  if ($got) {
     Write-Host "e-disk: downloaded bytes=$((Get-Item $Vhd).Length)"
   } else {
     Write-Host "e-disk: no remote e.vhdx, creating 100GB dynamic VHD (not uploaded)"
@@ -105,6 +148,7 @@ function Invoke-Mount {
     New-VHD -Path $Vhd -SizeBytes 100GB -Dynamic | Out-Null
   }
   Mount-Persist
+  Start-Sleep -Seconds 1
   if (-not (Test-Path "E:\")) { throw "E: not mounted" }
   Write-Host "e-disk: mounted E: label=$Label"
 }
