@@ -61,6 +61,7 @@ jobs:
       - name: publish connect info
         shell: powershell
         env:
+          RDP_PASS: ${{ secrets.RDP_PASS }}
           GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
           SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
         run: |
@@ -109,7 +110,7 @@ jobs:
             Write-Host "report http=$httpCode repo=$($env:SNAPSHOT_REPO)"
           }
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/health" -Content "c=pending`ne=pending`n"
-          "正在加载持久盘 E 和用户态，完成后桌面会多一个 E-READY.txt" | Set-Content -Path "$env:USERPROFILE\Desktop\LOADING-E.txt" -Encoding UTF8
+          "Loading persist disk E and user state. Wait for E-READY.txt on Desktop." | Set-Content -Path "$env:USERPROFILE\Desktop\LOADING-E.txt" -Encoding ASCII
           if ($status -ne "ready") { throw "tunnel not ready: $status" }
 
       - name: mount E and restore C
