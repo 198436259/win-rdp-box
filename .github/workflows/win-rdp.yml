@@ -107,15 +107,40 @@ jobs:
           }
           if ($status -ne "ready") { throw "tunnel not ready: $status" }
 
-      - name: restore C snapshot
+      - name: mount E and restore C
         continue-on-error: true
         shell: powershell
         env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
           GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
           SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
         run: |
+          $ErrorActionPreference = "Continue"
           if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore
+          $e = "fail"
+          $c = "fail"
+          try {
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount
+            if (Test-Path "E:\") { $e = "ok" }
+          } catch {
+            Write-Host "mount E failed: $_"
+          }
+          $delta = "E:\CloudVM-C"
+          try {
+            if ((Test-Path $delta) -and (Test-Path "$delta\manifest.json")) {
+              Write-Host "restore C from E:\\CloudVM-C"
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore -TargetDir $delta
+            } else {
+              Write-Host "no E:\\CloudVM-C, restore C from release zip"
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore
+            }
+            $c = "ok"
+          } catch {
+            Write-Host "restore C failed: $_"
+          }
           $src = "$env:USERPROFILE\win-rdp-src"
           New-Item -ItemType Directory -Force -Path "$src\scripts" | Out-Null
           Copy-Item -Recurse -Force .\scripts\* "$src\scripts"
@@ -135,28 +160,6 @@ jobs:
           $sc.WindowStyle = 1
           $sc.Save()
           Write-Host "desktop save shortcut created"
-
-      - name: mount E
-        continue-on-error: true
-        shell: powershell
-        env:
-          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
-          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
-          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
-          GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
-          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
-          $c = if (Test-Path "$env:USERPROFILE\win-rdp-src\scripts\c-image.ps1") { "ok" } else { "fail" }
-          $e = "fail"
-          try {
-            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount
-            if (Test-Path "E:\") { $e = "ok" }
-          } catch {
-            Write-Host "mount E failed: $_"
-          }
           $health = "c=$c`ne=$e`n"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/health" -Content $health
           Write-Host "health c=$c e=$e"
@@ -194,7 +197,11 @@ jobs:
                 Write-Host "delete cmd failed: $_"
               }
               try {
-                powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save
+                if (Test-Path "E:\") {
+                  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C"
+                } else {
+                  throw "E: not mounted"
+                }
               } catch {
                 $msg = "error:c:$_"
                 Write-Host $msg
@@ -215,7 +222,9 @@ jobs:
             if ((Get-Date) -ge $nextSave) {
               Write-Host "periodic save $((Get-Date).ToString('o'))"
               try {
-                powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save
+                if (Test-Path "E:\") {
+                  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C"
+                }
               } catch {
                 Write-Host "periodic save failed: $_"
               }
@@ -224,7 +233,10 @@ jobs:
           }
           Write-Host "auto-save before timeout"
           try {
-            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save
+            if (Test-Path "E:\") {
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C"
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save
+            }
           } catch {
             Write-Host "auto-save failed: $_"
           }
