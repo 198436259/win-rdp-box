@@ -13,21 +13,23 @@ jobs:
           OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
           OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
           if (-not $env:OSS_BUCKET) { throw "OSS_BUCKET missing" }
+          $size = [int64]25GB
           $dir = "D:\size25"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           $blob = Join-Path $dir "blob25.bin"
-          Write-Host "creating 25GB file (not sparse)"
+          Write-Host "creating 25GB file"
           $t0 = Get-Date
           $fs = [IO.File]::Open($blob, "Create", "Write", "None")
-          $fs.SetLength(25GB)
+          $fs.SetLength($size)
           $buf = New-Object byte[] (8MB)
           $rnd = [Random]::new()
+          $rnd.NextBytes($buf)
           $written = [int64]0
-          while ($written -lt 25GB) {
-            $n = [Math]::Min($buf.Length, 25GB - $written)
-            $rnd.NextBytes($buf)
+          while ($written -lt $size) {
+            $remain = $size - $written
+            $n = if ($remain -lt $buf.Length) { [int]$remain } else { $buf.Length }
             $fs.Write($buf, 0, $n)
             $written += $n
           }
@@ -48,21 +50,27 @@ jobs:
           $env:RCLONE_CONFIG_OSS_ENDPOINT = $env:OSS_ENDPOINT
           $remote = "oss:$($env:OSS_BUCKET)/size25-probe/"
 
+          function Invoke-RcloneCopy([string[]]$args) {
+            $out = & $exe @args 2>&1
+            $code = $LASTEXITCODE
+            $out | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) { throw "rclone exit=$code" }
+          }
+
           Write-Host "UPLOAD start"
           $t1 = Get-Date
-          & $exe copy $blob $remote --progress --local-no-sparse
-          if ($LASTEXITCODE -ne 0) { throw "upload failed" }
+          Invoke-RcloneCopy @("copy", $blob, $remote, "--progress", "--local-no-sparse")
           $upSec = ((Get-Date) - $t1).TotalSeconds
-          Write-Host ("UPLOAD_OK seconds={0:N1} mbps={1:N1}" -f $upSec, ((25GB / 1MB) / $upSec))
+          $mb = $size / 1MB
+          Write-Host ("UPLOAD_OK seconds={0:N1} MiB/s={1:N1}" -f $upSec, ($mb / $upSec))
 
           Remove-Item $blob -Force
           Write-Host "DOWNLOAD start"
           $t2 = Get-Date
-          & $exe copy ($remote + "blob25.bin") $dir --progress --local-no-sparse
-          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          Invoke-RcloneCopy @("copy", ($remote + "blob25.bin"), $dir, "--progress", "--local-no-sparse")
           $downSec = ((Get-Date) - $t2).TotalSeconds
-          Write-Host ("DOWNLOAD_OK bytes={0} seconds={1:N1} mbps={2:N1}" -f (Get-Item $blob).Length, $downSec, ((25GB / 1MB) / $downSec))
+          Write-Host ("DOWNLOAD_OK bytes={0} seconds={1:N1} MiB/s={2:N1}" -f (Get-Item $blob).Length, $downSec, ($mb / $downSec))
 
           Write-Host "cleanup remote probe object"
-          & $exe deletefile ($remote + "blob25.bin")
+          & $exe deletefile ($remote + "blob25.bin") 2>&1 | ForEach-Object { Write-Host $_ }
           Write-Host ("SUMMARY create={0:N1}s upload={1:N1}s download={2:N1}s" -f $createSec, $upSec, $downSec)
