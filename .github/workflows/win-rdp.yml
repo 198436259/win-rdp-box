@@ -122,11 +122,19 @@ jobs:
           if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
           $e = "fail"
           $c = "fail"
+          $mountLog = Join-Path $env:RUNNER_TEMP "e-mount.log"
           try {
-            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 |
+              Tee-Object -FilePath $mountLog
             if (Test-Path "E:\") { $e = "ok" }
           } catch {
             Write-Host "mount E failed: $_"
+            $_ | Out-File -FilePath $mountLog -Append -Encoding utf8
+          }
+          if (Test-Path $mountLog) {
+            $logText = Get-Content $mountLog -Raw -ErrorAction SilentlyContinue
+            if ($logText.Length -gt 15000) { $logText = $logText.Substring($logText.Length - 15000) }
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/e-mount.log" -Content $logText
           }
           $delta = "E:\CloudVM-C"
           try {
