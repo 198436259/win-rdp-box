@@ -188,11 +188,40 @@ jobs:
           $sc.Save()
           Write-Host "desktop save shortcut created"
 
+      - name: mount E
+        continue-on-error: true
+        shell: powershell
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
+          GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
+          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
+          $c = if (Test-Path "$env:USERPROFILE\win-rdp-src\scripts\c-image.ps1") { "ok" } else { "fail" }
+          $e = "fail"
+          try {
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount
+            if (Test-Path "E:\") { $e = "ok" }
+          } catch {
+            Write-Host "mount E failed: $_"
+          }
+          $health = "c=$c`ne=$e`n"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/health" -Content $health
+          Write-Host "health c=$c e=$e"
+
       - name: keep alive
         shell: powershell
         env:
           GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
           SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
         run: |
           if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
           Write-Host "keepalive start"
@@ -200,6 +229,38 @@ jobs:
           $nextSave = (Get-Date).AddMinutes(60)
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 60
+            $cmd = ""
+            try {
+              $cmd = powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action get -RelPath ".box/cmd"
+            } catch {
+              Write-Host "cmd poll failed: $_"
+            }
+            if (([string]$cmd).Trim() -eq "shutdown") {
+              Write-Host "shutdown cmd received"
+              try {
+                powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action delete -RelPath ".box/cmd"
+              } catch {
+                Write-Host "delete cmd failed: $_"
+              }
+              try {
+                powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save
+              } catch {
+                $msg = "error:c:$_"
+                Write-Host $msg
+                powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/cmd-result" -Content $msg
+                continue
+              }
+              $result = "ok"
+              try {
+                powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save
+              } catch {
+                $result = "error:e:$_"
+                Write-Host $result
+              }
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/cmd-result" -Content $result
+              Write-Host "shutdown sequence done result=$result"
+              break
+            }
             if ((Get-Date) -ge $nextSave) {
               Write-Host "periodic save $((Get-Date).ToString('o'))"
               try {
