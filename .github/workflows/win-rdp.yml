@@ -39,16 +39,13 @@ jobs:
           netstat -an | findstr ":3389"
           Write-Host "rdp enabled nla=off securitylayer=rdp"
 
-      - name: ngrok tcp 3389
+      - name: start ngrok tcp 3389
         shell: powershell
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
-          GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
-          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
         run: |
           $ErrorActionPreference = "Stop"
           if (-not $env:NGROK_AUTHTOKEN) { throw "NGROK_AUTHTOKEN secret missing" }
-          if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
           $zip = Join-Path $env:RUNNER_TEMP "ngrok.zip"
           $dir = Join-Path $env:RUNNER_TEMP "ngrok"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -59,53 +56,7 @@ jobs:
           & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
           $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
           Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
-          $pub = $null
-          for ($i = 0; $i -lt 40; $i++) {
-            Start-Sleep -Seconds 3
-            try {
-              $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
-              foreach ($t in @($j.tunnels)) {
-                $u = [string]$t.public_url
-                if ($u -match "^tcp://") { $pub = $u; break }
-              }
-            } catch {}
-            if ($pub) { break }
-          }
-          if (-not $pub -and (Test-Path $log)) {
-            Write-Host "----- ngrok.log -----"
-            Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 40
-          }
-          $status = "ready"
-          $rdpHost = ""
-          $rdpPort = ""
-          if (-not $pub) {
-            $status = "ngrok-no-url"
-          } elseif ($pub -match "tcp://([^:]+):(\d+)") {
-            $rdpHost = $Matches[1]
-            $rdpPort = $Matches[2]
-          } else {
-            $status = "ngrok-bad-url"
-          }
-          Write-Host "tunnel status=$status"
-          $body = "status=$status`nhost=$rdpHost`nport=$rdpPort`npass=$env:RDP_PASS`nurl=$pub`n"
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
-          $path = ".box/$($env:GITHUB_RUN_ID).txt"
-          $payload = (@{ message = "box $($env:GITHUB_RUN_ID)"; content = $b64 } | ConvertTo-Json -Compress)
-          $payloadFile = Join-Path $env:RUNNER_TEMP "box.json"
-          [IO.File]::WriteAllText($payloadFile, $payload)
-          if ($env:GITHUB_TOKEN) {
-            $httpCode = & curl.exe -sS -o "$env:RUNNER_TEMP\box-resp.txt" -w "%{http_code}" -X PUT `
-              -H "Authorization: Bearer $($env:GITHUB_TOKEN)" `
-              -H "Accept: application/vnd.github+json" `
-              -H "X-GitHub-Api-Version: 2022-11-28" `
-              -H "Content-Type: application/json" `
-              --data-binary "@$payloadFile" `
-              "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/$path"
-            Write-Host "report http=$httpCode repo=$($env:SNAPSHOT_REPO)"
-          } else {
-            Write-Host "GITHUB_TOKEN empty, skip report"
-          }
-          if ($status -ne "ready") { throw "tunnel not ready: $status" }
+          Write-Host "ngrok started in background"
 
       - name: mount E and restore C
         continue-on-error: true
@@ -171,6 +122,49 @@ jobs:
           $health = "c=$c`ne=$e`n"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/health" -Content $health
           Write-Host "health c=$c e=$e"
+          $pub = $null
+          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+          for ($i = 0; $i -lt 20; $i++) {
+            try {
+              $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
+              foreach ($t in @($j.tunnels)) {
+                $u = [string]$t.public_url
+                if ($u -match "^tcp://") { $pub = $u; break }
+              }
+            } catch {}
+            if ($pub) { break }
+            Start-Sleep -Seconds 3
+          }
+          $status = "ready"
+          $rdpHost = ""
+          $rdpPort = ""
+          if (-not $pub) {
+            $status = "ngrok-no-url"
+            if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 40 }
+          } elseif ($pub -match "tcp://([^:]+):(\d+)") {
+            $rdpHost = $Matches[1]
+            $rdpPort = $Matches[2]
+          } else {
+            $status = "ngrok-bad-url"
+          }
+          Write-Host "tunnel status=$status"
+          $body = "status=$status`nhost=$rdpHost`nport=$rdpPort`npass=$env:RDP_PASS`nurl=$pub`n"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+          $path = ".box/$($env:GITHUB_RUN_ID).txt"
+          $payload = (@{ message = "box $($env:GITHUB_RUN_ID)"; content = $b64 } | ConvertTo-Json -Compress)
+          $payloadFile = Join-Path $env:RUNNER_TEMP "box.json"
+          [IO.File]::WriteAllText($payloadFile, $payload)
+          if ($env:GITHUB_TOKEN) {
+            $httpCode = & curl.exe -sS -o "$env:RUNNER_TEMP\box-resp.txt" -w "%{http_code}" -X PUT `
+              -H "Authorization: Bearer $($env:GITHUB_TOKEN)" `
+              -H "Accept: application/vnd.github+json" `
+              -H "X-GitHub-Api-Version: 2022-11-28" `
+              -H "Content-Type: application/json" `
+              --data-binary "@$payloadFile" `
+              "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/$path"
+            Write-Host "report http=$httpCode repo=$($env:SNAPSHOT_REPO)"
+          }
+          if ($status -ne "ready") { throw "tunnel not ready: $status" }
 
       - name: keep alive
         shell: powershell
