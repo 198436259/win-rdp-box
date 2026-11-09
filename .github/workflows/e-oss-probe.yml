@@ -1,0 +1,88 @@
+name: e-oss-probe
+on: workflow_dispatch
+jobs:
+  save:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: make E from VHD on D
+        shell: powershell
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:OSS_ACCESS_KEY_ID) { throw "OSS_ACCESS_KEY_ID missing" }
+          if (-not $env:OSS_BUCKET) { throw "OSS_BUCKET missing" }
+          if (-not $env:OSS_ENDPOINT) { throw "OSS_ENDPOINT missing" }
+
+          $vhd = "D:\e-probe.vhdx"
+          if (Test-Path $vhd) { Remove-Item $vhd -Force }
+          New-VHD -Path $vhd -SizeBytes 1GB -Dynamic | Out-Null
+          $img = Mount-DiskImage -ImagePath $vhd -PassThru
+          $disk = $img | Get-Disk
+          Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru |
+            New-Partition -UseMaximumSize -DriveLetter E |
+            Format-Volume -FileSystem NTFS -NewFileSystemLabel "persist" -Confirm:$false | Out-Null
+          "probe $(Get-Date -Format o) run=$env:GITHUB_RUN_ID" | Set-Content -Path "E:\hello.txt" -Encoding UTF8
+          Get-Volume E | Format-Table DriveLetter, FileSystemLabel, Size, SizeRemaining | Out-String
+          Get-Content "E:\hello.txt"
+          Dismount-DiskImage -ImagePath $vhd
+          "vhd bytes=$((Get-Item $vhd).Length)"
+
+          $rclone = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $rclone | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $rclone -Force
+          $exe = Get-ChildItem $rclone -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_OSS_TYPE = "s3"
+          $env:RCLONE_CONFIG_OSS_PROVIDER = "Alibaba"
+          $env:RCLONE_CONFIG_OSS_ACCESS_KEY_ID = $env:OSS_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_OSS_SECRET_ACCESS_KEY = $env:OSS_ACCESS_KEY_SECRET
+          $env:RCLONE_CONFIG_OSS_ENDPOINT = $env:OSS_ENDPOINT
+          & $exe copy $vhd "oss:$($env:OSS_BUCKET)/e-probe/" --progress
+          & $exe ls "oss:$($env:OSS_BUCKET)/e-probe/"
+
+  restore:
+    needs: save
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: restore E from OSS
+        shell: powershell
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $rclone = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $rclone | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $rclone -Force
+          $exe = Get-ChildItem $rclone -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_OSS_TYPE = "s3"
+          $env:RCLONE_CONFIG_OSS_PROVIDER = "Alibaba"
+          $env:RCLONE_CONFIG_OSS_ACCESS_KEY_ID = $env:OSS_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_OSS_SECRET_ACCESS_KEY = $env:OSS_ACCESS_KEY_SECRET
+          $env:RCLONE_CONFIG_OSS_ENDPOINT = $env:OSS_ENDPOINT
+          $vhd = "D:\e-probe.vhdx"
+          & $exe copy "oss:$($env:OSS_BUCKET)/e-probe/e-probe.vhdx" "D:\" --progress
+          if (-not (Test-Path $vhd)) { throw "vhd not downloaded" }
+          "downloaded bytes=$((Get-Item $vhd).Length)"
+          Mount-DiskImage -ImagePath $vhd | Out-Null
+          $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq "persist" } | Select-Object -First 1
+          if (-not $vol.DriveLetter) { throw "no persist volume" }
+          $letter = $vol.DriveLetter
+          if ($letter -ne "E") {
+            Get-Partition -DriveLetter $letter | Set-Partition -NewDriveLetter E
+          }
+          Get-Content "E:\hello.txt"
+          if (-not (Test-Path "E:\hello.txt")) { throw "hello.txt missing on E:" }
+          "RESTORE_OK"
+          Dismount-DiskImage -ImagePath $vhd
