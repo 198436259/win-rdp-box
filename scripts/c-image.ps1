@@ -2,7 +2,8 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidateSet("save", "restore")]
   [string]$Action,
-  [string]$OutZip = ""
+  [string]$OutZip = "",
+  [string]$TargetDir = ""
 )
 
 $ErrorActionPreference = "Continue"
@@ -217,6 +218,29 @@ function Save-Image {
     $byteCount += $_.Length
   }
   $logins = @(Get-LoginApps)
+  if ($TargetDir) {
+    New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+    $manifestEarly = [pscustomobject]@{
+      kind      = "c-delta"
+      savedAt   = [DateTime]::UtcNow.ToString("o")
+      user      = $env:USERNAME
+      computer  = $env:COMPUTERNAME
+      system    = [pscustomobject]@{
+        files     = $fileCount
+        bytes     = $byteCount
+        keys      = $keyCount
+        variables = $varCount
+        trees     = $copied
+      }
+      logins    = $logins
+      note      = "User-state delta on persist volume. Not a full C: image."
+    }
+    $manifestEarly | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $Stage "manifest.json") -Encoding UTF8
+    & robocopy $Stage $TargetDir /MIR /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    $loginHint = if ($logins.Count) { " logins=" + (($logins | ForEach-Object { $_.app }) -join ",") } else { "" }
+    Write-Host ("c-delta dir={0} files={1} keys={2} variables={3}{4}" -f $TargetDir, $fileCount, $keyCount, $varCount, $loginHint)
+    return
+  }
   $manifest = [pscustomobject]@{
     kind      = "c-delta"
     savedAt   = [DateTime]::UtcNow.ToString("o")
@@ -281,26 +305,37 @@ function Save-Image {
 }
 
 function Restore-Image {
-  if (-not $env:GITHUB_TOKEN) { Write-Host "no token, skip restore"; return }
-  $headers = Get-GhHeaders
-  try {
-    $rel = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$(Get-SnapshotRepo)/releases/tags/c-image"
-  } catch {
-    Write-Host "no c-image release yet, skip restore"
-    return
+  $fromDir = $false
+  if ($TargetDir -and (Test-Path (Join-Path $TargetDir "manifest.json"))) {
+    Write-Host "restore from $TargetDir"
+    $Stage = $TargetDir
+    $FilesRoot = Join-Path $Stage "system\files"
+    $RegDir = Join-Path $Stage "system\registry"
+    $LoginRoot = Join-Path $Stage "logins"
+    $fromDir = $true
   }
-  $asset = @($rel.assets | Where-Object { $_.name -eq "c-snapshot.zip" }) | Select-Object -First 1
-  if (-not $asset) { Write-Host "no c-snapshot.zip asset, skip restore"; return }
-  Write-Host "downloading snapshot id=$($asset.id) size=$($asset.size)"
-  & curl.exe -fsSL -L -H "Authorization: Bearer $($env:GITHUB_TOKEN)" -H "Accept: application/octet-stream" -o $Zip $asset.url
-  if (-not (Test-Path $Zip) -or ((Get-Item $Zip).Length -lt 100)) { Write-Host "download failed"; return }
-  if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
-  New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-  try {
-    & tar.exe -a -x -f $Zip -C $Stage 2>$null
-  } catch {}
-  if (-not (Get-ChildItem $Stage -ErrorAction SilentlyContinue)) {
-    Expand-Archive -Path $Zip -DestinationPath $Stage -Force
+  if (-not $fromDir) {
+    if (-not $env:GITHUB_TOKEN) { Write-Host "no token, skip restore"; return }
+    $headers = Get-GhHeaders
+    try {
+      $rel = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$(Get-SnapshotRepo)/releases/tags/c-image"
+    } catch {
+      Write-Host "no c-image release yet, skip restore"
+      return
+    }
+    $asset = @($rel.assets | Where-Object { $_.name -eq "c-snapshot.zip" }) | Select-Object -First 1
+    if (-not $asset) { Write-Host "no c-snapshot.zip asset, skip restore"; return }
+    Write-Host "downloading snapshot id=$($asset.id) size=$($asset.size)"
+    & curl.exe -fsSL -L -H "Authorization: Bearer $($env:GITHUB_TOKEN)" -H "Accept: application/octet-stream" -o $Zip $asset.url
+    if (-not (Test-Path $Zip) -or ((Get-Item $Zip).Length -lt 100)) { Write-Host "download failed"; return }
+    if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+    try {
+      & tar.exe -a -x -f $Zip -C $Stage 2>$null
+    } catch {}
+    if (-not (Get-ChildItem $Stage -ErrorAction SilentlyContinue)) {
+      Expand-Archive -Path $Zip -DestinationPath $Stage -Force
+    }
   }
 
   $man = Join-Path $Stage "manifest.json"
