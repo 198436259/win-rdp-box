@@ -58,6 +58,60 @@ jobs:
           Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
           Write-Host "ngrok started in background"
 
+      - name: publish connect info
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
+          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
+          $pub = $null
+          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+          for ($i = 0; $i -lt 40; $i++) {
+            try {
+              $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
+              foreach ($t in @($j.tunnels)) {
+                $u = [string]$t.public_url
+                if ($u -match "^tcp://") { $pub = $u; break }
+              }
+            } catch {}
+            if ($pub) { break }
+            Start-Sleep -Seconds 3
+          }
+          $status = "ready"
+          $rdpHost = ""
+          $rdpPort = ""
+          if (-not $pub) {
+            $status = "ngrok-no-url"
+            if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 40 }
+          } elseif ($pub -match "tcp://([^:]+):(\d+)") {
+            $rdpHost = $Matches[1]
+            $rdpPort = $Matches[2]
+          } else {
+            $status = "ngrok-bad-url"
+          }
+          Write-Host "tunnel status=$status host=$rdpHost port=$rdpPort"
+          $body = "status=$status`nhost=$rdpHost`nport=$rdpPort`npass=$env:RDP_PASS`nurl=$pub`n"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+          $path = ".box/$($env:GITHUB_RUN_ID).txt"
+          $payload = (@{ message = "box $($env:GITHUB_RUN_ID)"; content = $b64 } | ConvertTo-Json -Compress)
+          $payloadFile = Join-Path $env:RUNNER_TEMP "box.json"
+          [IO.File]::WriteAllText($payloadFile, $payload)
+          if ($env:GITHUB_TOKEN) {
+            $httpCode = & curl.exe -sS -o "$env:RUNNER_TEMP\box-resp.txt" -w "%{http_code}" -X PUT `
+              -H "Authorization: Bearer $($env:GITHUB_TOKEN)" `
+              -H "Accept: application/vnd.github+json" `
+              -H "X-GitHub-Api-Version: 2022-11-28" `
+              -H "Content-Type: application/json" `
+              --data-binary "@$payloadFile" `
+              "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/$path"
+            Write-Host "report http=$httpCode repo=$($env:SNAPSHOT_REPO)"
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/health" -Content "c=pending`ne=pending`n"
+          "正在加载持久盘 E 和用户态，完成后桌面会多一个 E-READY.txt" | Set-Content -Path "$env:USERPROFILE\Desktop\LOADING-E.txt" -Encoding UTF8
+          if ($status -ne "ready") { throw "tunnel not ready: $status" }
+
       - name: mount E and restore C
         continue-on-error: true
         shell: powershell
@@ -122,49 +176,8 @@ jobs:
           $health = "c=$c`ne=$e`n"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/health" -Content $health
           Write-Host "health c=$c e=$e"
-          $pub = $null
-          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
-          for ($i = 0; $i -lt 20; $i++) {
-            try {
-              $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
-              foreach ($t in @($j.tunnels)) {
-                $u = [string]$t.public_url
-                if ($u -match "^tcp://") { $pub = $u; break }
-              }
-            } catch {}
-            if ($pub) { break }
-            Start-Sleep -Seconds 3
-          }
-          $status = "ready"
-          $rdpHost = ""
-          $rdpPort = ""
-          if (-not $pub) {
-            $status = "ngrok-no-url"
-            if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 40 }
-          } elseif ($pub -match "tcp://([^:]+):(\d+)") {
-            $rdpHost = $Matches[1]
-            $rdpPort = $Matches[2]
-          } else {
-            $status = "ngrok-bad-url"
-          }
-          Write-Host "tunnel status=$status"
-          $body = "status=$status`nhost=$rdpHost`nport=$rdpPort`npass=$env:RDP_PASS`nurl=$pub`n"
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
-          $path = ".box/$($env:GITHUB_RUN_ID).txt"
-          $payload = (@{ message = "box $($env:GITHUB_RUN_ID)"; content = $b64 } | ConvertTo-Json -Compress)
-          $payloadFile = Join-Path $env:RUNNER_TEMP "box.json"
-          [IO.File]::WriteAllText($payloadFile, $payload)
-          if ($env:GITHUB_TOKEN) {
-            $httpCode = & curl.exe -sS -o "$env:RUNNER_TEMP\box-resp.txt" -w "%{http_code}" -X PUT `
-              -H "Authorization: Bearer $($env:GITHUB_TOKEN)" `
-              -H "Accept: application/vnd.github+json" `
-              -H "X-GitHub-Api-Version: 2022-11-28" `
-              -H "Content-Type: application/json" `
-              --data-binary "@$payloadFile" `
-              "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/$path"
-            Write-Host "report http=$httpCode repo=$($env:SNAPSHOT_REPO)"
-          }
-          if ($status -ne "ready") { throw "tunnel not ready: $status" }
+          Remove-Item "$env:USERPROFILE\Desktop\LOADING-E.txt" -ErrorAction SilentlyContinue
+          "c=$c e=$e $(Get-Date -Format o)" | Set-Content -Path "$env:USERPROFILE\Desktop\E-READY.txt" -Encoding UTF8
 
       - name: keep alive
         shell: powershell
