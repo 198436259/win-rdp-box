@@ -34,8 +34,13 @@ function Get-Meta([string]$path) {
   try {
     return Invoke-RestMethod -Headers (Get-Headers) -Uri (Get-ContentsUri $path)
   } catch {
+    $msg = [string]$_
     $resp = $_.Exception.Response
-    if ($resp -and [int]$resp.StatusCode -eq 404) { return $null }
+    $code = 0
+    if ($resp) {
+      try { $code = [int]$resp.StatusCode } catch { $code = 0 }
+    }
+    if ($code -eq 404 -or $msg -match "404") { return $null }
     throw
   }
 }

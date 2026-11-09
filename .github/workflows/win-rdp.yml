@@ -223,19 +223,22 @@ jobs:
           OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
           OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
         run: |
+          $ErrorActionPreference = "Continue"
           if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
           Write-Host "keepalive start"
           $deadline = (Get-Date).AddMinutes(350)
           $nextSave = (Get-Date).AddMinutes(60)
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 60
-            $cmd = ""
+            $cmdText = ""
             try {
-              $cmd = powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action get -RelPath ".box/cmd"
+              $out = powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action get -RelPath ".box/cmd" 2>&1 |
+                Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }
+              if ($null -ne $out) { $cmdText = ([string]($out | Select-Object -Last 1)).Trim() }
             } catch {
               Write-Host "cmd poll failed: $_"
             }
-            if (([string]$cmd).Trim() -eq "shutdown") {
+            if ($cmdText -eq "shutdown") {
               Write-Host "shutdown cmd received"
               try {
                 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action delete -RelPath ".box/cmd"

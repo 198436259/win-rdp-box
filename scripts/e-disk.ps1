@@ -38,6 +38,33 @@ function Get-OssVhd {
   return "oss:$($env:OSS_BUCKET)/e.vhdx"
 }
 
+function Invoke-Rclone {
+  param([string[]]$RcloneArgs)
+  $exe = Get-RcloneExe
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $out = & $exe @RcloneArgs 2>&1
+    $code = $LASTEXITCODE
+    $lines = @()
+    foreach ($item in @($out)) {
+      $text = [string]$item
+      if ($text -match "NOTICE: Config file") { continue }
+      if ($item -is [System.Management.Automation.ErrorRecord] -and $text -match "NOTICE:") { continue }
+      $lines += $text
+      if ($item -is [System.Management.Automation.ErrorRecord] -and $text -notmatch "NOTICE:") {
+        Write-Host $text
+      } elseif ($item -isnot [System.Management.Automation.ErrorRecord]) {
+        Write-Host $text
+      }
+    }
+    if ($code -ne 0) { throw "rclone exit=$code args=$($RcloneArgs -join ' ')" }
+    return $lines
+  } finally {
+    $ErrorActionPreference = $old
+  }
+}
+
 function Mount-Persist {
   $img = Mount-DiskImage -ImagePath $Vhd -PassThru
   $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq $Label } | Select-Object -First 1
@@ -61,16 +88,15 @@ function Mount-Persist {
 
 function Invoke-Mount {
   Set-RcloneOssEnv
-  $exe = Get-RcloneExe
   $remote = Get-OssVhd
-  $listed = & $exe lsf "oss:$($env:OSS_BUCKET)/" --include "e.vhdx" 2>$null
+  $listed = Invoke-Rclone @("lsf", "oss:$($env:OSS_BUCKET)/", "--include", "e.vhdx")
   $has = $false
   foreach ($line in @($listed)) {
-    if ([string]$line -match "^e\.vhdx$") { $has = $true }
+    if (([string]$line).Trim() -match "^e\.vhdx$") { $has = $true }
   }
   if ($has) {
     Write-Host "e-disk: downloading e.vhdx"
-    & $exe copy $remote "D:\" --progress
+    Invoke-Rclone @("copy", $remote, "D:\", "--progress") | Out-Null
     if (-not (Test-Path $Vhd)) { throw "e.vhdx not downloaded" }
     Write-Host "e-disk: downloaded bytes=$((Get-Item $Vhd).Length)"
   } else {
@@ -89,10 +115,9 @@ function Invoke-Save {
     Dismount-DiskImage -ImagePath $Vhd | Out-Null
   }
   if (-not (Test-Path $Vhd)) { throw "D:\e.vhdx missing, skip upload not allowed" }
-  $exe = Get-RcloneExe
   Write-Host "e-disk: uploading bytes=$((Get-Item $Vhd).Length)"
-  & $exe copy $Vhd "oss:$($env:OSS_BUCKET)/" --progress
-  & $exe ls "oss:$($env:OSS_BUCKET)/e.vhdx"
+  Invoke-Rclone @("copy", $Vhd, "oss:$($env:OSS_BUCKET)/", "--progress") | Out-Null
+  Invoke-Rclone @("ls", "oss:$($env:OSS_BUCKET)/e.vhdx") | Out-Null
   Write-Host "e-disk: uploaded e.vhdx"
 }
 
