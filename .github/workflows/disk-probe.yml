@@ -1,0 +1,35 @@
+name: disk-probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: disk inventory
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          "=== Get-Disk ==="
+          Get-Disk | Format-Table Number, FriendlyName, BusType, Size, PartitionStyle -AutoSize | Out-String
+          "=== Get-Partition ==="
+          Get-Partition | Format-Table DiskNumber, DriveLetter, Size, Type -AutoSize | Out-String
+          "=== Get-Volume ==="
+          Get-Volume | Format-Table DriveLetter, FileSystemLabel, FileSystem, Size, SizeRemaining -AutoSize | Out-String
+          "=== cmdlets ==="
+          Get-Command New-VHD, Mount-VHD, Dismount-VHD, Mount-DiskImage, Optimize-VHD, Initialize-Disk -ErrorAction SilentlyContinue |
+            Select-Object Name, Source | Format-Table -AutoSize | Out-String
+          "=== optional features ==="
+          Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V* -ErrorAction SilentlyContinue |
+            Select-Object FeatureName, State | Format-Table -AutoSize | Out-String
+          "=== vhd try 256MB ==="
+          $vhd = Join-Path $env:TEMP "probe.vhdx"
+          try {
+            New-VHD -Path $vhd -SizeBytes 256MB -Dynamic -ErrorAction Stop
+            "New-VHD ok"
+          } catch { "New-VHD fail: $($_.Exception.Message)" }
+          try {
+            Mount-DiskImage -ImagePath $vhd -ErrorAction Stop
+            "Mount-DiskImage ok"
+            Dismount-DiskImage -ImagePath $vhd -ErrorAction SilentlyContinue
+          } catch { "Mount-DiskImage fail: $($_.Exception.Message)" }
+          if (Test-Path $vhd) { Remove-Item $vhd -Force }
