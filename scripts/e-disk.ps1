@@ -47,6 +47,19 @@ function Get-OssVhd {
   return "oss:$($env:OSS_BUCKET)/e.vhdx"
 }
 
+function ConvertTo-Nonsparse([string]$path) {
+  if (-not (Test-Path $path)) { return }
+  $tmp = Join-Path (Split-Path $path) ("nonsparse-" + [IO.Path]::GetFileName($path))
+  Write-Host "e-disk: copying to non-sparse $tmp"
+  & cmd.exe /c "copy /y `"$path`" `"$tmp`""
+  if (-not (Test-Path $tmp) -or ((Get-Item $tmp).Length -lt 1MB)) {
+    throw "e-disk: non-sparse copy failed"
+  }
+  Remove-Item $path -Force
+  Move-Item $tmp $path -Force
+  Write-Host "e-disk: non-sparse bytes=$((Get-Item $path).Length)"
+}
+
 function Invoke-Rclone {
   param([string[]]$RcloneArgs)
   $exe = Get-RcloneExe
@@ -142,11 +155,10 @@ function Mount-Persist {
   }
   Start-Sleep -Seconds 2
   try { Update-HostStorageCache } catch {}
-  $disk = Get-Disk | Where-Object {
-    $_.Location -like "*e.vhdx*" -or $_.FriendlyName -match "Virtual"
-  } | Sort-Object Number -Descending | Select-Object -First 1
+  $disk = $null
+  try { $disk = Get-DiskImage -ImagePath $Vhd -ErrorAction Stop | Get-Disk -ErrorAction Stop } catch {}
   if (-not $disk) {
-    $disk = Get-DiskImage -ImagePath $Vhd -ErrorAction SilentlyContinue | Get-Disk -ErrorAction SilentlyContinue
+    $disk = Get-Disk | Where-Object { $_.Location -like "*e.vhdx*" } | Select-Object -First 1
   }
   if ($disk) {
     Write-Host ("e-disk: disk#={0} style={1} size={2} name={3}" -f $disk.Number, $disk.PartitionStyle, $disk.Size, $disk.FriendlyName)
@@ -189,13 +201,14 @@ function Invoke-Mount {
   Write-Host "e-disk: trying download e.vhdx"
   $got = $false
   try {
-    Invoke-Rclone @("copy", $remote, "D:\", "--progress") | Out-Null
+    Invoke-Rclone @("copy", $remote, (Split-Path $Vhd), "--progress", "--local-no-sparse") | Out-Null
     if ((Test-Path $Vhd) -and ((Get-Item $Vhd).Length -gt 1MB)) { $got = $true }
   } catch {
     Write-Host "e-disk: download failed: $_"
   }
   if ($got) {
     Write-Host "e-disk: downloaded bytes=$((Get-Item $Vhd).Length)"
+    ConvertTo-Nonsparse $Vhd
   } else {
     Write-Host "e-disk: no remote e.vhdx, creating 100GB dynamic VHD (not uploaded)"
     if (Test-Path $Vhd) { Remove-Item $Vhd -Force }
