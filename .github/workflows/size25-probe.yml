@@ -50,8 +50,9 @@ jobs:
           $env:RCLONE_CONFIG_OSS_ENDPOINT = $env:OSS_ENDPOINT
           $remote = "oss:$($env:OSS_BUCKET)/size25-probe/"
 
-          function Invoke-RcloneCopy([string[]]$args) {
-            $out = & $exe @args 2>&1
+          function Invoke-RcloneCopy {
+            param([string[]]$RcloneArgs)
+            $out = & $exe @RcloneArgs 2>&1
             $code = $LASTEXITCODE
             $out | ForEach-Object { Write-Host $_ }
             if ($code -ne 0) { throw "rclone exit=$code" }
