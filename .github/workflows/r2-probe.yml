@@ -1,0 +1,69 @@
+name: r2-probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: rclone round trip on R2
+        shell: powershell
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:R2_BUCKET) { throw "R2_BUCKET missing" }
+
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          $root = if (Test-Path "D:\") { "D:\r2probe" } else { Join-Path $env:RUNNER_TEMP "r2probe" }
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $up = Join-Path $root "up"
+          $down = Join-Path $root "down"
+          New-Item -ItemType Directory -Force -Path $up, $down | Out-Null
+
+          # 64 MiB pseudo-random blob, comparable to a real VHD slice
+          $size = 64MB
+          $f = Join-Path $up "probe64.bin"
+          $fs = [IO.File]::Open($f, "Create", "Write", "None")
+          $buf = New-Object byte[] (4MB)
+          $rnd = [Random]::new(7)
+          for ($i = 0; $i -lt 16; $i++) { $rnd.NextBytes($buf); $fs.Write($buf, 0, $buf.Length) }
+          $fs.Close()
+          Write-Host ("probe bytes={0}" -f (Get-Item $f).Length)
+
+          Write-Host "=== upload 64MiB ==="
+          $t0 = Get-Date
+          & $exe copy $f "r2:$($env:R2_BUCKET)/probe/" --no-traverse --stats-one-line
+          if ($LASTEXITCODE -ne 0) { throw "upload failed $LASTEXITCODE" }
+          $sec = ((Get-Date) - $t0).TotalSeconds
+          Write-Host ("UPLOAD seconds={0:N1} MBps={1:N1}" -f $sec, (64 / $sec))
+
+          Write-Host "=== download 64MiB ==="
+          $t0 = Get-Date
+          & $exe copy "r2:$($env:R2_BUCKET)/probe/probe64.bin" $down --no-traverse --local-no-sparse --stats-one-line
+          if ($LASTEXITCODE -ne 0) { throw "download failed $LASTEXITCODE" }
+          $sec = ((Get-Date) - $t0).TotalSeconds
+          Write-Host ("DOWNLOAD seconds={0:N1} MBps={1:N1}" -f $sec, (64 / $sec))
+
+          $a = (Get-FileHash $f -Algorithm SHA256).Hash
+          $b = (Get-FileHash (Join-Path $down "probe64.bin") -Algorithm SHA256).Hash
+          Write-Host ("HASH match={0}" -f ($a -eq $b))
+
+          & $exe delete "r2:$($env:R2_BUCKET)/probe/probe64.bin" 2>&1 | Out-Host
+          Write-Host "R2_PROBE_DONE"
