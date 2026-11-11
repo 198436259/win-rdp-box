@@ -1,0 +1,112 @@
+name: r2-compact
+on: workflow_dispatch
+jobs:
+  compact:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: copy user data into a fresh small VHDX and replace the remote
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Work = if (Test-Path "D:\") { "D:\compact" } else { Join-Path $env:RUNNER_TEMP "compact" }
+          New-Item -ItemType Directory -Force -Path $Work | Out-Null
+          $OldVhd = Join-Path $Work "old.vhdx"
+          $NewVhd = Join-Path $Work "e.vhdx"
+          $Label = "persist"
+
+          function W([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f $n) }
+
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          W "1 DOWNLOAD CURRENT PERSIST VOLUME"
+          $t = Get-Date
+          & $exe copy "r2:$($env:R2_BUCKET)/e.vhdx" $Work --local-no-sparse --stats 30s --stats-one-line
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          Move-Item (Join-Path $Work "e.vhdx") $OldVhd -Force
+          Write-Host ("old bytes={0} seconds={1:N1}" -f (Get-Item $OldVhd).Length, ((Get-Date) - $t).TotalSeconds)
+
+          W "2 MOUNT OLD AS E:"
+          $oi = Mount-DiskImage -ImagePath $OldVhd -PassThru -ErrorAction Stop
+          Start-Sleep -Seconds 2
+          try { Update-HostStorageCache } catch {}
+          $ovol = Get-Volume | Where-Object { $_.FileSystemLabel -eq $Label } | Select-Object -First 1
+          if (-not $ovol) { throw "old volume not found" }
+          $odisk = $oi | Get-Disk
+          if ([string]$ovol.DriveLetter -ne "E") {
+            $p = Get-Partition -Volume $ovol
+            Set-Partition -DiskNumber $odisk.Number -PartitionNumber $p.PartitionNumber -NewDriveLetter "E"
+            Start-Sleep -Seconds 2
+          }
+          Write-Host "old volume mounted at E:"
+
+          W "3 CREATE FRESH 100GB DYNAMIC VHD, MOUNT AS F:"
+          New-VHD -Path $NewVhd -SizeBytes 100GB -Dynamic | Out-Null
+          $ni = Mount-DiskImage -ImagePath $NewVhd -PassThru -ErrorAction Stop
+          Start-Sleep -Seconds 2
+          try { Update-HostStorageCache } catch {}
+          $ndisk = $ni | Get-Disk
+          if ([string]$ndisk.PartitionStyle -ne "RAW") { throw "new VHD not RAW" }
+          Initialize-Disk -Number $ndisk.Number -PartitionStyle GPT -PassThru |
+            New-Partition -UseMaximumSize -DriveLetter "F" |
+            Format-Volume -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false | Out-Null
+          Start-Sleep -Seconds 2
+          if (-not (Test-Path "F:\")) { throw "F: missing" }
+          Write-Host "new volume mounted at F:"
+
+          W "4 COPY USER DATA E: -> F:"
+          $t = Get-Date
+          & robocopy "E:\" "F:\" /MIR /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
+          $code = $LASTEXITCODE
+          if ($code -ge 8) { throw "robocopy failed $code" }
+          Write-Host ("copy seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
+
+          $oldFiles = 0; $oldBytes = [long]0
+          Get-ChildItem "E:\" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $oldFiles++; $oldBytes += $_.Length }
+          $newFiles = 0; $newBytes = [long]0
+          Get-ChildItem "F:\" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $newFiles++; $newBytes += $_.Length }
+          Write-Host ("RESULT old files={0} bytes={1}" -f $oldFiles, $oldBytes)
+          Write-Host ("RESULT new files={0} bytes={1}" -f $newFiles, $newBytes)
+          Write-Host ("RESULT match={0}" -f (($oldFiles -eq $newFiles) -and ($oldBytes -eq $newBytes)))
+
+          W "5 DISMOUNT BOTH"
+          Dismount-DiskImage -ImagePath $OldVhd | Out-Null
+          Dismount-DiskImage -ImagePath $NewVhd | Out-Null
+          Start-Sleep -Seconds 4
+          $nb = [long](Get-Item $NewVhd).Length
+          Write-Host ("RESULT new vhdx bytes={0} ({1:N2} GiB)" -f $nb, ($nb / 1GB))
+
+          W "6 UPLOAD NEW"
+          $t = Get-Date
+          & $exe copy $NewVhd "r2:$($env:R2_BUCKET)/" --s3-chunk-size 64M --stats 15s --stats-one-line
+          if ($LASTEXITCODE -ne 0) { throw "upload failed" }
+          Write-Host ("upload seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
+          & $exe ls "r2:$($env:R2_BUCKET)/e.vhdx"
+
+          W "7 REMOVE TEST WORKFLOWS' LEFTOVERS"
+          $old = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          & $exe delete "r2:$($env:R2_BUCKET)/r2-e2e/" 2>&1 | Out-Host
+          & $exe delete "r2:$($env:R2_BUCKET)/chunk-probe/" 2>&1 | Out-Host
+          $ErrorActionPreference = $old
+
+          Write-Host ""
+          Write-Host "COMPACT_DONE"
