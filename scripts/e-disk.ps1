@@ -242,7 +242,8 @@ function Invoke-Save {
   }
   if (-not (Test-Path $Vhd)) { throw "D:\e.vhdx missing, skip upload not allowed" }
   Write-Host "e-disk: uploading bytes=$((Get-Item $Vhd).Length)"
-  Invoke-Rclone @("copy", $Vhd, "r2:$($env:R2_BUCKET)/", "--progress") | Out-Null
+  # 64MiB chunks: fewer Class A ops per save (R2 bills $4.50/million writes).
+  Invoke-Rclone @("copy", $Vhd, "r2:$($env:R2_BUCKET)/", "--progress", "--s3-chunk-size", "64M") | Out-Null
   Invoke-Rclone @("ls", "r2:$($env:R2_BUCKET)/e.vhdx") | Out-Null
   Write-Host "e-disk: uploaded e.vhdx"
 }
