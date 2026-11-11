@@ -31,20 +31,22 @@ function Get-RcloneExe {
   return (Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName)
 }
 
-function Set-RcloneOssEnv {
-  if (-not $env:OSS_ACCESS_KEY_ID) { throw "OSS_ACCESS_KEY_ID missing" }
-  if (-not $env:OSS_ACCESS_KEY_SECRET) { throw "OSS_ACCESS_KEY_SECRET missing" }
-  if (-not $env:OSS_BUCKET) { throw "OSS_BUCKET missing" }
-  if (-not $env:OSS_ENDPOINT) { throw "OSS_ENDPOINT missing" }
-  $env:RCLONE_CONFIG_OSS_TYPE = "s3"
-  $env:RCLONE_CONFIG_OSS_PROVIDER = "Alibaba"
-  $env:RCLONE_CONFIG_OSS_ACCESS_KEY_ID = $env:OSS_ACCESS_KEY_ID
-  $env:RCLONE_CONFIG_OSS_SECRET_ACCESS_KEY = $env:OSS_ACCESS_KEY_SECRET
-  $env:RCLONE_CONFIG_OSS_ENDPOINT = $env:OSS_ENDPOINT
+function Set-RcloneR2Env {
+  if (-not $env:R2_ACCESS_KEY_ID) { throw "R2_ACCESS_KEY_ID missing" }
+  if (-not $env:R2_SECRET_ACCESS_KEY) { throw "R2_SECRET_ACCESS_KEY missing" }
+  if (-not $env:R2_BUCKET) { throw "R2_BUCKET missing" }
+  if (-not $env:R2_ENDPOINT) { throw "R2_ENDPOINT missing" }
+  $env:RCLONE_CONFIG_R2_TYPE = "s3"
+  $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+  $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+  $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+  $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+  $env:RCLONE_CONFIG_R2_REGION = "auto"
+  $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
 }
 
-function Get-OssVhd {
-  return "oss:$($env:OSS_BUCKET)/e.vhdx"
+function Get-R2Vhd {
+  return "r2:$($env:R2_BUCKET)/e.vhdx"
 }
 
 function Test-Sparse([string]$path) {
@@ -208,8 +210,8 @@ function Mount-Persist {
 }
 
 function Invoke-Mount {
-  Set-RcloneOssEnv
-  $remote = Get-OssVhd
+  Set-RcloneR2Env
+  $remote = Get-R2Vhd
   if (Test-Path $Vhd) { Remove-Item $Vhd -Force }
   Write-Host "e-disk: trying download e.vhdx"
   $got = $false
@@ -234,14 +236,14 @@ function Invoke-Mount {
 }
 
 function Invoke-Save {
-  Set-RcloneOssEnv
+  Set-RcloneR2Env
   if (Get-DiskImage -ImagePath $Vhd -ErrorAction SilentlyContinue | Where-Object { $_.Attached }) {
     Dismount-DiskImage -ImagePath $Vhd | Out-Null
   }
   if (-not (Test-Path $Vhd)) { throw "D:\e.vhdx missing, skip upload not allowed" }
   Write-Host "e-disk: uploading bytes=$((Get-Item $Vhd).Length)"
-  Invoke-Rclone @("copy", $Vhd, "oss:$($env:OSS_BUCKET)/", "--progress") | Out-Null
-  Invoke-Rclone @("ls", "oss:$($env:OSS_BUCKET)/e.vhdx") | Out-Null
+  Invoke-Rclone @("copy", $Vhd, "r2:$($env:R2_BUCKET)/", "--progress") | Out-Null
+  Invoke-Rclone @("ls", "r2:$($env:R2_BUCKET)/e.vhdx") | Out-Null
   Write-Host "e-disk: uploaded e.vhdx"
 }
 
