@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   e2e:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
