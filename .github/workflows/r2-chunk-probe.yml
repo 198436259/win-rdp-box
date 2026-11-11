@@ -1,0 +1,86 @@
+name: r2-chunk-probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: count multipart chunks at 64MiB
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          $root = if (Test-Path "D:\") { "D:\chunkprobe" } else { Join-Path $env:RUNNER_TEMP "chunkprobe" }
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $f = Join-Path $root "blob.bin"
+          $target = [long](3.44GB)
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(11).NextBytes($buf)
+          $fs = [IO.File]::Open($f, "Create", "Write", "None")
+          try {
+            $w = [long]0
+            while ($w -lt $target) {
+              $c = [int][Math]::Min([long]$buf.Length, ($target - $w))
+              $fs.Write($buf, 0, $c)
+              $w += $c
+            }
+          } finally { $fs.Close() }
+          $bytes = [long](Get-Item $f).Length
+          Write-Host ("blob bytes={0}" -f $bytes)
+
+          $log = Join-Path $root "up64.log"
+          $t0 = Get-Date
+          $old = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          & $exe copy $f "r2:$($env:R2_BUCKET)/chunk-probe64/" --s3-chunk-size 64M -vv *> $log
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = $old
+          if ($code -ne 0) { throw "upload failed exit=$code" }
+          $sec = ((Get-Date) - $t0).TotalSeconds
+          $chunks64 = (Select-String -Path $log -Pattern "Sending chunk" -SimpleMatch).Count
+          Write-Host ("GAUGE upload64 seconds={0:N1} MBps={1:N1}" -f $sec, (($bytes / 1MB) / $sec))
+          Write-Host ("RESULT bytes={0} chunks_64M={1}" -f $bytes, $chunks64)
+          Write-Host ("EXPECTED chunks if 64MiB = {0}" -f [Math]::Ceiling($bytes / 64MB))
+
+          $log5 = Join-Path $root "up5.log"
+          $t0 = Get-Date
+          $old = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          & $exe copy $f "r2:$($env:R2_BUCKET)/chunk-probe5/" -vv *> $log5
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = $old
+          if ($code -ne 0) { throw "upload5 failed exit=$code" }
+          $sec = ((Get-Date) - $t0).TotalSeconds
+          $chunks5 = (Select-String -Path $log5 -Pattern "Sending chunk" -SimpleMatch).Count
+          Write-Host ("GAUGE upload5 seconds={0:N1} MBps={1:N1}" -f $sec, (($bytes / 1MB) / $sec))
+          Write-Host ("RESULT chunks_default={0}" -f $chunks5)
+          Write-Host ("RESULT class_a_saved_per_save={0}" -f ($chunks5 - $chunks64))
+
+          foreach ($prefix in "chunk-probe64/", "chunk-probe5/") {
+            $old = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            & $exe delete "r2:$($env:R2_BUCKET)/$prefix" 2>&1 | Out-Host
+            $ErrorActionPreference = $old
+          }
+
+          Write-Host "CHUNK_PROBE_DONE"
