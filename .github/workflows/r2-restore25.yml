@@ -1,0 +1,79 @@
+name: r2-restore25
+on: workflow_dispatch
+jobs:
+  restore:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: trim test data and re-upload
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Work = if (Test-Path "D:\") { "D:\restore25" } else { Join-Path $env:RUNNER_TEMP "restore25" }
+          New-Item -ItemType Directory -Force -Path $Work | Out-Null
+          $Vhd = Join-Path $Work "e.vhdx"
+          $Letter = "E"
+          $Label = "persist"
+
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          & $exe copy "r2:$($env:R2_BUCKET)/e.vhdx" $Work --local-no-sparse --stats 30s --stats-one-line
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+
+          $img = Mount-DiskImage -ImagePath $Vhd -PassThru -ErrorAction Stop
+          Start-Sleep -Seconds 2
+          try { Update-HostStorageCache } catch {}
+          $disk = $img | Get-Disk
+          $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq $Label } | Select-Object -First 1
+          if (-not $vol) { throw "no volume labelled $Label" }
+          if ([string]$vol.DriveLetter -ne $Letter) {
+            $p = Get-Partition -Volume $vol
+            Set-Partition -DiskNumber $disk.Number -PartitionNumber $p.PartitionNumber -NewDriveLetter $Letter
+            Start-Sleep -Seconds 2
+          }
+
+          $bulk = Join-Path "${Letter}:\" "bulk25.bin"
+          if (Test-Path $bulk) {
+            Write-Host ("restore: removing bulk25 bytes={0}" -f (Get-Item $bulk).Length)
+            Remove-Item $bulk -Force
+          }
+          Get-ChildItem "${Letter}:\" -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+          Start-Sleep -Seconds 2
+          Dismount-DiskImage -ImagePath $Vhd | Out-Null
+          Start-Sleep -Seconds 3
+
+          # compact so the upload does not carry the freed blocks
+          try {
+            Optimize-VHD -Path $Vhd -Mode Full -ErrorAction Stop
+            Write-Host "restore: Optimize-VHD ok"
+          } catch {
+            Write-Host "restore: Optimize-VHD unavailable ($_)"
+          }
+
+          $bytes = [long](Get-Item $Vhd).Length
+          Write-Host ("restore: vhdx bytes={0} ({1:N2} GiB)" -f $bytes, ($bytes / 1GB))
+
+          & $exe copy $Vhd "r2:$($env:R2_BUCKET)/" --s3-chunk-size 64M --stats 30s --stats-one-line
+          if ($LASTEXITCODE -ne 0) { throw "upload failed" }
+          & $exe ls "r2:$($env:R2_BUCKET)/e.vhdx"
+          Write-Host "RESTORE25_DONE"
