@@ -3,14 +3,14 @@ on: workflow_dispatch
 jobs:
   probe:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
     steps:
-      - name: count multipart chunks at 64MiB
+      - name: count multipart parts from HTTP headers
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -21,6 +21,7 @@ jobs:
           curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
           Expand-Archive $zip $dir -Force
           $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          Write-Host ("rclone {0}" -f (& $exe version | Select-Object -First 1))
 
           $env:RCLONE_CONFIG_R2_TYPE = "s3"
           $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
@@ -47,36 +48,30 @@ jobs:
           } finally { $fs.Close() }
           $bytes = [long](Get-Item $f).Length
           Write-Host ("blob bytes={0}" -f $bytes)
+          Write-Host ("expected parts at 5MiB={0} at 64MiB={1}" -f [Math]::Ceiling($bytes / 5MB), [Math]::Ceiling($bytes / 64MB))
 
-          $log = Join-Path $root "up64.log"
-          $t0 = Get-Date
-          $old = $ErrorActionPreference
-          $ErrorActionPreference = "Continue"
-          & $exe copy $f "r2:$($env:R2_BUCKET)/chunk-probe64/" --s3-chunk-size 64M -vv *> $log
-          $code = $LASTEXITCODE
-          $ErrorActionPreference = $old
-          if ($code -ne 0) { throw "upload failed exit=$code" }
-          $sec = ((Get-Date) - $t0).TotalSeconds
-          $chunks64 = (Select-String -Path $log -Pattern "Sending chunk" -SimpleMatch).Count
-          Write-Host ("GAUGE upload64 seconds={0:N1} MBps={1:N1}" -f $sec, (($bytes / 1MB) / $sec))
-          Write-Host ("RESULT bytes={0} chunks_64M={1}" -f $bytes, $chunks64)
-          Write-Host ("EXPECTED chunks if 64MiB = {0}" -f [Math]::Ceiling($bytes / 64MB))
+          function Measure-Upload([string]$label, [string]$prefix, [string[]]$extra) {
+            $log = Join-Path $root ("$label.log")
+            $args = @("copy", $f, "r2:$($env:R2_BUCKET)/$prefix", "--dump", "headers") + $extra
+            $t0 = Get-Date
+            $old = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            & $exe @args *> $log
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = $old
+            if ($code -ne 0) { throw "$label upload failed exit=$code" }
+            $sec = ((Get-Date) - $t0).TotalSeconds
+            $parts = (Select-String -Path $log -Pattern "partNumber=" -AllMatches).Matches.Count
+            $puts = (Select-String -Path $log -Pattern "> PUT ").Count
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $label, $sec, (($bytes / 1MB) / $sec))
+            Write-Host ("RESULT {0} part_requests={1} put_requests={2}" -f $label, $parts, $puts)
+          }
 
-          $log5 = Join-Path $root "up5.log"
-          $t0 = Get-Date
-          $old = $ErrorActionPreference
-          $ErrorActionPreference = "Continue"
-          & $exe copy $f "r2:$($env:R2_BUCKET)/chunk-probe5/" -vv *> $log5
-          $code = $LASTEXITCODE
-          $ErrorActionPreference = $old
-          if ($code -ne 0) { throw "upload5 failed exit=$code" }
-          $sec = ((Get-Date) - $t0).TotalSeconds
-          $chunks5 = (Select-String -Path $log5 -Pattern "Sending chunk" -SimpleMatch).Count
-          Write-Host ("GAUGE upload5 seconds={0:N1} MBps={1:N1}" -f $sec, (($bytes / 1MB) / $sec))
-          Write-Host ("RESULT chunks_default={0}" -f $chunks5)
-          Write-Host ("RESULT class_a_saved_per_save={0}" -f ($chunks5 - $chunks64))
+          Measure-Upload "default5" "chunk-probe/d5/" @()
+          Measure-Upload "chunk64" "chunk-probe/c64/" @("--s3-chunk-size", "64M")
+          Measure-Upload "chunk64b" "chunk-probe/c64b/" @("--s3-chunk-size", "64M")
 
-          foreach ($prefix in "chunk-probe64/", "chunk-probe5/") {
+          foreach ($prefix in "chunk-probe/d5/", "chunk-probe/c64/", "chunk-probe/c64b/", "chunk-probe64/", "chunk-probe5/") {
             $old = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
             & $exe delete "r2:$($env:R2_BUCKET)/$prefix" 2>&1 | Out-Host
