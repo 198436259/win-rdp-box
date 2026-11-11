@@ -1,0 +1,116 @@
+name: r2-fill25
+on: workflow_dispatch
+jobs:
+  fill:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: grow e.vhdx to 25GB and upload
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $TargetBytes = [long](25GB)
+          $Work = if (Test-Path "D:\") { "D:\fill25" } else { Join-Path $env:RUNNER_TEMP "fill25" }
+          New-Item -ItemType Directory -Force -Path $Work | Out-Null
+          $Vhd = Join-Path $Work "e.vhdx"
+          $Letter = "E"
+          $Label = "persist"
+
+          function W([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f $n) }
+          function G([string]$n, [double]$s, [double]$mb) {
+            $r = if ($s -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
+          }
+
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          W "0 DOWNLOAD EXISTING e.vhdx"
+          $t = Get-Date
+          & $exe copy "r2:$($env:R2_BUCKET)/e.vhdx" $Work --local-no-sparse --stats 15s --stats-one-line
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          $s = ((Get-Date) - $t).TotalSeconds
+          $orig = [long](Get-Item $Vhd).Length
+          G "download_before" $s ($orig / 1MB)
+          Write-Host ("RESULT original bytes={0}" -f $orig)
+
+          W "1 MOUNT"
+          $img = Mount-DiskImage -ImagePath $Vhd -PassThru -ErrorAction Stop
+          Start-Sleep -Seconds 2
+          try { Update-HostStorageCache } catch {}
+          $disk = $img | Get-Disk
+          $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq $Label } | Select-Object -First 1
+          if (-not $vol) { throw "no volume labelled $Label" }
+          if ([string]$vol.DriveLetter -ne $Letter) {
+            $p = Get-Partition -Volume $vol
+            Set-Partition -DiskNumber $disk.Number -PartitionNumber $p.PartitionNumber -NewDriveLetter $Letter
+            Start-Sleep -Seconds 2
+          }
+          Write-Host ("RESULT mounted style={0} letter={1}" -f $disk.PartitionStyle, (Get-Volume -DriveLetter $Letter).DriveLetter)
+
+          W "2 FILL TO 25GB"
+          $existing = [long]0
+          Get-ChildItem "${Letter}:\" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $existing += $_.Length }
+          Write-Host ("RESULT existing_bytes={0}" -f $existing)
+          $need = $TargetBytes - $existing
+          if ($need -lt 0) { throw "existing data already exceeds 25GB" }
+          Write-Host ("fill needed bytes={0}" -f $need)
+
+          $bulk = Join-Path "${Letter}:\" "bulk25.bin"
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(23).NextBytes($buf)
+          $t = Get-Date
+          $fs = [IO.File]::Open($bulk, "Create", "Write", "None")
+          try {
+            $w = [long]0
+            while ($w -lt $need) {
+              $c = [int][Math]::Min([long]$buf.Length, ($need - $w))
+              $fs.Write($buf, 0, $c)
+              $w += $c
+              if (($w % 2GB) -lt $buf.Length) {
+                $el = ((Get-Date) - $t).TotalSeconds
+                Write-Host ("fill {0:N1}/{1:N1} GB {2:N1} MBps" -f ($w / 1GB), ($need / 1GB), (($w / 1MB) / $el))
+              }
+            }
+          } finally { $fs.Close() }
+          $s = ((Get-Date) - $t).TotalSeconds
+          G "fill" $s ($need / 1MB)
+          Write-Host ("RESULT bulk25 bytes={0}" -f (Get-Item $bulk).Length)
+
+          W "3 DISMOUNT"
+          $t = Get-Date
+          Dismount-DiskImage -ImagePath $Vhd | Out-Null
+          Start-Sleep -Seconds 3
+          $s = ((Get-Date) - $t).TotalSeconds
+          G "dismount" $s 0
+          $big = [long](Get-Item $Vhd).Length
+          Write-Host ("RESULT vhdx_bytes={0} ({1:N2} GiB)" -f $big, ($big / 1GB))
+
+          W "4 UPLOAD 25GB+ TO R2 (64MiB chunks)"
+          $t = Get-Date
+          & $exe copy $Vhd "r2:$($env:R2_BUCKET)/" --s3-chunk-size 64M --stats 15s --stats-one-line
+          if ($LASTEXITCODE -ne 0) { throw "upload failed" }
+          $s = ((Get-Date) - $t).TotalSeconds
+          G "upload" $s ($big / 1MB)
+          & $exe ls "r2:$($env:R2_BUCKET)/e.vhdx"
+
+          Write-Host ""
+          Write-Host "FILL25_DONE"
