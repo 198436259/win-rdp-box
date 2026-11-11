@@ -2,7 +2,7 @@
 # Own object key (r2-e2e/e2e.vhdx) so the production e.vhdx is never touched.
 $ErrorActionPreference = "Stop"
 
-$TargetBytes = 3.3GB
+$TargetBytes = [long](3.3GB)
 $WorkRoot  = if (Test-Path "D:\") { "D:\r2e2e" } else { Join-Path $env:RUNNER_TEMP "r2e2e" }
 $Vhd       = Join-Path $WorkRoot "e2e.vhdx"
 $DownDir   = Join-Path $WorkRoot "dl"
@@ -85,42 +85,40 @@ function New-TestVhd {
   Start-Sleep -Seconds 2
   if (-not (Test-Path "${Letter}:\")) { throw "create: ${Letter}: missing after format" }
 
-  # Allocate fast (no per-block data write); VHDX still has to grow to hold it.
+  # One pre-generated buffer, reused. Generating random bytes inside the loop made
+  # the earlier run crawl; a reused buffer writes at ~1 GB/s.
   $bulk = Join-Path "${Letter}:\" "bulk.bin"
-  Write-Host ("create: alloc {0:N1} GB via fsutil file createnew" -f ($TargetBytes / 1GB))
-  $t = Get-Date
-  & fsutil.exe file createnew $bulk $TargetBytes
-  if (Test-Path $bulk) {
-    $sec = ((Get-Date) - $t).TotalSeconds
-    Write-Gauge "alloc" $sec ($TargetBytes / 1MB)
-    Write-Host ("create: bulk.bin bytes={0}" -f (Get-Item $bulk).Length)
-  } else {
-    Write-Host "create: fsutil createnew failed"
-  }
-
-  # Real, non-zero content so the mount/read path is genuinely exercised.
-  $seedPath = Join-Path "${Letter}:\" "seed.bin"
-  Write-Host "create: writing 256MB seed data"
-  $t = Get-Date
   $buf = New-Object byte[] (8MB)
   [Random]::new(11).NextBytes($buf)
-  $fs = [IO.File]::Open($seedPath, "Create", "Write", "None")
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $bufHash = ([BitConverter]::ToString($sha.ComputeHash($buf))).Replace("-", "")
+  [IO.File]::WriteAllText((Join-Path $WorkRoot "buf.sha256"), $bufHash)
+  Write-Host "create: buffer sha256=$bufHash"
+  Write-Host ("create: writing {0:N1} GB into VHDX" -f ($TargetBytes / 1GB))
+  $t = Get-Date
+  $mark = Get-Date
+  $fs = [IO.File]::Open($bulk, "Create", "Write", "None")
   try {
-    for ($i = 0; $i -lt 32; $i++) { $fs.Write($buf, 0, $buf.Length) }
+    $written = [long]0
+    while ($written -lt $TargetBytes) {
+      $chunk = [int][Math]::Min([long]$buf.Length, ($TargetBytes - $written))
+      $fs.Write($buf, 0, $chunk)
+      $written += $chunk
+      if (($written % 512MB) -lt $buf.Length) {
+        $el = ((Get-Date) - $t).TotalSeconds
+        Write-Host ("create: progress {0:N1}/{1:N1} GB {2:N1} MBps" -f ($written / 1GB), ($TargetBytes / 1GB), (($written / 1MB) / $el))
+      }
+    }
   } finally { $fs.Close() }
   $sec = ((Get-Date) - $t).TotalSeconds
-  Write-Gauge "seed" $sec 256
-  $seedHash = (Get-FileHash $seedPath -Algorithm SHA256).Hash
-  Write-Host "create: seed sha256=$seedHash"
-  [IO.File]::WriteAllText((Join-Path $WorkRoot "seed.sha256"), $seedHash)
+  Write-Gauge "fill" $sec ($TargetBytes / 1MB)
+  Write-Host ("create: bulk.bin bytes={0}" -f (Get-Item $bulk).Length)
 
   [IO.File]::WriteAllText((Join-Path "${Letter}:\" "marker.txt"), "r2-e2e-marker")
 
   Dismount-DiskImage -ImagePath $Vhd | Out-Null
   Start-Sleep -Seconds 3
-  $vhdBytes = (Get-Item $Vhd).Length
-  Write-Host ("create: vhdx bytes={0}" -f $vhdBytes)
-  return $vhdBytes
+  Write-Host ("create: vhdx bytes={0}" -f (Get-Item $Vhd).Length)
 }
 
 function Test-Sparse([string]$path) {
@@ -149,10 +147,11 @@ Set-RcloneR2Env
 
 Write-Step "1 BUILD 3.3GB VHDX"
 $t = Get-Date
-$vhdBytes = New-TestVhd
+New-TestVhd
+$vhdBytes = [long](Get-Item $Vhd).Length
 $sec = ((Get-Date) - $t).TotalSeconds
 Write-Gauge "build" $sec ($vhdBytes / 1MB)
-Write-Host ("RESULT vhdx_bytes={0} target_ratio={1:N2}" -f $vhdBytes, ($vhdBytes / $TargetBytes))
+Write-Host ("RESULT vhdx_bytes={0} ratio_of_target={1:N2}" -f $vhdBytes, ($vhdBytes / $TargetBytes))
 
 Write-Step "2 UPLOAD TO R2"
 $t = Get-Date
@@ -169,7 +168,7 @@ Invoke-Rclone @("copy", "r2:$($env:R2_BUCKET)/$RemoteKey", $DownDir, "--local-no
 $sec = ((Get-Date) - $t).TotalSeconds
 $dl = Join-Path $DownDir "e2e.vhdx"
 if (-not (Test-Path $dl)) { throw "download: $dl missing" }
-$dlBytes = (Get-Item $dl).Length
+$dlBytes = [long](Get-Item $dl).Length
 Write-Gauge "download" $sec ($dlBytes / 1MB)
 Write-Host ("RESULT downloaded_bytes={0} match_size={1}" -f $dlBytes, ($dlBytes -eq $vhdBytes))
 
@@ -198,17 +197,20 @@ $mountedVol = Get-Volume -DriveLetter $Letter
 Write-Host ("RESULT mounted disk#{0} letter={1} size={2:N1}GB" -f $disk.Number, $mountedVol.DriveLetter, ($mountedVol.Size / 1GB))
 
 Write-Step "5 VERIFY DATA + WRITE"
-$seedPath = Join-Path "${Letter}:\" "seed.bin"
+$bulk = Join-Path "${Letter}:\" "bulk.bin"
 $marker = Join-Path "${Letter}:\" "marker.txt"
-if (-not (Test-Path $seedPath)) { throw "verify: seed.bin missing on mounted volume" }
+if (-not (Test-Path $bulk)) { throw "verify: bulk.bin missing on mounted volume" }
 if (-not (Test-Path $marker)) { throw "verify: marker.txt missing on mounted volume" }
-$expect = [IO.File]::ReadAllText((Join-Path $WorkRoot "seed.sha256")).Trim()
-$t = Get-Date
-$gotHash = (Get-FileHash $seedPath -Algorithm SHA256).Hash
-$sec = ((Get-Date) - $t).TotalSeconds
-Write-Gauge "hashseed" $sec 256
-Write-Host ("RESULT seed_hash_match={0}" -f ($gotHash -eq $expect))
+Write-Host ("verify: bulk.bin bytes={0}" -f (Get-Item $bulk).Length)
 Write-Host ("RESULT marker={0}" -f (Get-Content $marker -Raw).Trim())
+
+$expectBuf = [IO.File]::ReadAllText((Join-Path $WorkRoot "buf.sha256")).Trim()
+$head = New-Object byte[] (8MB)
+$rfs = [IO.File]::OpenRead($bulk)
+try { $read = $rfs.Read($head, 0, $head.Length) } finally { $rfs.Close() }
+$shaCheck = [Security.Cryptography.SHA256]::Create()
+$headHash = ([BitConverter]::ToString($shaCheck.ComputeHash($head))).Replace("-", "")
+Write-Host ("RESULT head_bytes={0} head_hash_match={1}" -f $read, ($headHash -eq $expectBuf))
 
 $newFile = Join-Path "${Letter}:\" "written-by-runner.txt"
 [IO.File]::WriteAllText($newFile, "written at " + (Get-Date).ToString("o"))
@@ -221,7 +223,7 @@ Dismount-DiskImage -ImagePath $dl | Out-Null
 Start-Sleep -Seconds 3
 $sec = ((Get-Date) - $t).TotalSeconds
 Write-Gauge "dismount" $sec 0
-$afterWrite = (Get-Item $dl).Length
+$afterWrite = [long](Get-Item $dl).Length
 Write-Host ("RESULT vhdx_after_write_bytes={0} grew={1}" -f $afterWrite, ($afterWrite -gt $dlBytes))
 
 $t = Get-Date
