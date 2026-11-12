@@ -1,0 +1,128 @@
+name: r2-size25-truth
+on: workflow_dispatch
+jobs:
+  truth:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: read and write the whole 24GB through the mount
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          function G([string]$n, [double]$s, [double]$mb) {
+            $r = if ($s -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
+          }
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
+          curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          Write-Host ("RESULT winfsp_exit={0}" -f $p.ExitCode)
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          $cache = if (Test-Path "D:\") { "D:\vfscache" } else { Join-Path $env:RUNNER_TEMP "vfscache" }
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP "mount.log"
+          $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList @(
+            "mount", "r2:$($env:R2_BUCKET)/size25", "E:",
+            "--vfs-cache-mode", "full", "--cache-dir", $cache,
+            "--links", "--dir-cache-time", "10s", "--transfers", "16",
+            "--file-perms", "0777", "--dir-perms", "0777",
+            "--rc", "--rc-addr", "127.0.0.1:5572",
+            "--log-file", $log, "--log-level", "INFO"
+          )
+          for ($i = 0; $i -lt 240; $i++) { Start-Sleep -Milliseconds 250; if (Test-Path "E:\") { break } }
+          Write-Host ("RESULT mounted={0}" -f (Test-Path "E:\"))
+          $sz = (Get-Item "E:\bulk.bin").Length
+          Write-Host ("RESULT bulk_bytes={0}" -f $sz)
+
+          Write-Host "--- READ the whole 24GB from R2 through the mount ---"
+          $t = Get-Date
+          $f = [IO.File]::Open("E:\bulk.bin", "Open", "Read", "Read")
+          $rb = New-Object byte[] (8MB)
+          $got = [long]0
+          $sha = [Security.Cryptography.SHA256]::Create()
+          while ($true) {
+            $n = $f.Read($rb, 0, $rb.Length)
+            if ($n -le 0) { break }
+            $sha.TransformBlock($rb, 0, $n, $null, 0) | Out-Null
+            $got += $n
+            if (($got % 4GB) -lt $rb.Length) {
+              $el = ((Get-Date) - $t).TotalSeconds
+              Write-Host ("read {0:N1} GB {1:N1} MBps" -f ($got/1GB), (($got/1MB)/$el))
+            }
+          }
+          $f.Close()
+          $sha.TransformFinalBlock(@(), 0, 0) | Out-Null
+          $readHash = ([BitConverter]::ToString($sha.Hash)).Replace("-", "")
+          $rs = ((Get-Date) - $t).TotalSeconds
+          G "full_read_24gb" $rs ($got / 1MB)
+          Write-Host ("RESULT read_bytes={0} sha256_prefix={1}" -f $got, $readHash.Substring(0,16))
+
+          Write-Host "--- WRITE a new 24GB file through the mount ---"
+          $t = Get-Date
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(3).NextBytes($buf)
+          $out = [IO.File]::Open("E:\written24.bin", "Create", "Write", "None")
+          $wsha = [Security.Cryptography.SHA256]::Create()
+          $wrote = [long]0
+          $target = [long](24GB)
+          while ($wrote -lt $target) {
+            $c = [int][Math]::Min([long]$buf.Length, ($target - $wrote))
+            $out.Write($buf, 0, $c)
+            $wsha.TransformBlock($buf, 0, $c, $null, 0) | Out-Null
+            $wrote += $c
+            if (($wrote % 4GB) -lt $buf.Length) {
+              $el = ((Get-Date) - $t).TotalSeconds
+              Write-Host ("write {0:N1} GB {1:N1} MBps" -f ($wrote/1GB), (($wrote/1MB)/$el))
+            }
+          }
+          $out.Close()
+          $wsha.TransformFinalBlock(@(), 0, 0) | Out-Null
+          $writeHash = ([BitConverter]::ToString($wsha.Hash)).Replace("-", "")
+          $ws = ((Get-Date) - $t).TotalSeconds
+          G "full_write_24gb" $ws ($wrote / 1MB)
+          Write-Host ("RESULT wrote_bytes={0} sha256_prefix={1}" -f $wrote, $writeHash.Substring(0,16))
+
+          Write-Host "--- flush and unmount ---"
+          $t = Get-Date
+          $rcJob = Start-Job -ScriptBlock {
+            param($exe, $addr)
+            & $exe rc vfs/refresh --rc-addr $addr 2>&1 | Out-Null
+            & $exe rc mount/unmount mountPoint="E:" --rc-addr $addr 2>&1 | Out-Null
+          } -ArgumentList $exe, "127.0.0.1:5572"
+          $done = Wait-Job $rcJob -Timeout 60
+          if (-not $done) { Stop-Job $rcJob -ErrorAction SilentlyContinue; Write-Host "RESULT rc_unmount=timed_out" } else { Write-Host "RESULT rc_unmount=returned" }
+          Remove-Job $rcJob -Force -ErrorAction SilentlyContinue
+          if (Test-Path "E:\") {
+            Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 8
+            & cmd.exe /c "rmdir E:" 2>&1 | Out-Null
+          }
+          G "flush_unmount" ((Get-Date) - $t).TotalSeconds 0
+          Write-Host ("RESULT unmounted={0}" -f (-not (Test-Path "E:\")))
+
+          Write-Host "--- verify the written file is really in R2 ---"
+          Start-Sleep -Seconds 5
+          $remote = & $exe lsl "r2:$($env:R2_BUCKET)/size25/written24.bin" 2>&1 | Out-String
+          Write-Host ("RESULT written24_in_r2={0}" -f ($remote -match "written24.bin"))
+          Write-Host ("REMOTE " + ($remote -replace "\s+", " "))
+          & $exe delete "r2:$($env:R2_BUCKET)/size25/written24.bin" 2>&1 | Out-Null
+          Write-Host "TRUTH_DONE"
+          exit 0
