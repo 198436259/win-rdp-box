@@ -72,6 +72,18 @@ jobs:
           if (-not (Test-Path "F:\")) { throw "F: missing" }
           Write-Host "new volume mounted at F:"
 
+          W "3b DELETE TEST ARTIFACT FROM OLD VOLUME (before copy)"
+          $bulk = Join-Path "E:\" "bulk25.bin"
+          if (Test-Path $bulk) {
+            Write-Host ("removing test artifact bytes={0}" -f (Get-Item $bulk).Length)
+            Remove-Item $bulk -Force
+          } else {
+            Write-Host "no test artifact on old volume"
+          }
+          $keepFiles = 0; $keepBytes = [long]0
+          Get-ChildItem "E:\" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $keepFiles++; $keepBytes += $_.Length }
+          Write-Host ("RESULT kept files={0} bytes={1} ({2:N2} GiB)" -f $keepFiles, $keepBytes, ($keepBytes / 1GB))
+
           W "4 COPY USER DATA E: -> F:"
           $t = Get-Date
           & robocopy "E:\" "F:\" /MIR /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
@@ -86,18 +98,6 @@ jobs:
           Write-Host ("RESULT old files={0} bytes={1}" -f $oldFiles, $oldBytes)
           Write-Host ("RESULT new files={0} bytes={1}" -f $newFiles, $newBytes)
           Write-Host ("RESULT match={0}" -f (($oldFiles -eq $newFiles) -and ($oldBytes -eq $newBytes)))
-
-          W "4b REMOVE TEST ARTIFACT FROM NEW VOLUME"
-          $bulk = Join-Path "F:\" "bulk25.bin"
-          if (Test-Path $bulk) {
-            Write-Host ("removing test artifact bytes={0}" -f (Get-Item $bulk).Length)
-            Remove-Item $bulk -Force
-          } else {
-            Write-Host "no test artifact on new volume"
-          }
-          $keepFiles = 0; $keepBytes = [long]0
-          Get-ChildItem "F:\" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $keepFiles++; $keepBytes += $_.Length }
-          Write-Host ("RESULT kept files={0} bytes={1} ({2:N2} GiB)" -f $keepFiles, $keepBytes, ($keepBytes / 1GB))
 
           W "5 DISMOUNT BOTH"
           Dismount-DiskImage -ImagePath $OldVhd | Out-Null
