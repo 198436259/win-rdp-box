@@ -121,6 +121,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_E_PREFIX: size25
           GITHUB_TOKEN: ${{ secrets.SNAPSHOT_TOKEN || secrets.GITHUB_TOKEN }}
           SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
         run: |
@@ -152,6 +153,13 @@ jobs:
           $delta = "E:\CloudVM-C"
           try {
             if ((Test-Path $delta) -and (Test-Path "$delta\manifest.json")) {
+              try {
+                $manObj = Get-Content "$delta\manifest.json" -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+                if ($manObj -and $manObj.system -and ([int]$manObj.system.files -lt 50)) {
+                  Write-Host "CloudVM-C has $($manObj.system.files) files, restoring base release zip first"
+                  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore
+                }
+              } catch {}
               Write-Host "restore C from E:\\CloudVM-C"
               powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore -TargetDir $delta
             } else {
@@ -196,6 +204,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_E_PREFIX: size25
         run: |
           $ErrorActionPreference = "Continue"
           if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
