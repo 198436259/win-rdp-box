@@ -6,10 +6,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Letter = "E"
-$RcAddr = "127.0.0.1:5572"
 
 function Get-WorkRoot {
-  if (Test-Path "D:\") { return "D:\e-disk" }
+  if ((Test-Path "D:\") -and ((Get-PSDrive D).Free -gt 20GB)) { return "D:\e-disk" }
   $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
   New-Item -ItemType Directory -Force -Path $root | Out-Null
   return (Join-Path $root "e-disk")
@@ -17,11 +16,12 @@ function Get-WorkRoot {
 
 $Work = Get-WorkRoot
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
-$LogPath = Join-Path $Work "mount.log"
-$CacheDir = Join-Path $Work "vfs-cache"
-$ConfPath = Join-Path $Work "rclone.conf"
+$BaseVhd = Join-Path $Work "base.vhdx"
+$BaseZst = Join-Path $Work "base.vhdx.zst"
+$DiffVhd = Join-Path $Work "diff.vhdx"
+$DiffZst = Join-Path $Work "diff.vhdx.zst"
+$NeedBaseFlag = Join-Path $Work "need-base-upload.flag"
 $BaselinePath = Join-Path $Work "boot-baseline.json"
-$TaskName = "FlexPCRcloneMountE"
 
 function Save-BootBaseline {
   if (Test-Path $BaselinePath) { return }
@@ -65,17 +65,16 @@ function Get-RcloneExe {
   return (Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName)
 }
 
-function Install-WinFsp {
-  $svc = Get-Service -Name WinFsp -ErrorAction SilentlyContinue
-  if ($svc) {
-    Write-Host "e-disk: WinFsp present"
-    return
-  }
-  $msi = Join-Path $Work "winfsp.msi"
-  Write-Host "e-disk: installing WinFsp"
-  curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
-  $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
-  if ($p.ExitCode -ne 0) { throw "WinFsp install exit=$($p.ExitCode)" }
+function Get-ZstdExe {
+  $dir = Join-Path $Work "zstd"
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $exe = Get-ChildItem $dir -Recurse -Filter zstd.exe -ErrorAction SilentlyContinue |
+    Select-Object -First 1 -ExpandProperty FullName
+  if ($exe) { return $exe }
+  $zip = Join-Path $dir "zstd.zip"
+  curl.exe -fsSL -o $zip "https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-v1.5.6-win64.zip"
+  Expand-Archive $zip $dir -Force
+  return (Get-ChildItem $dir -Recurse -Filter zstd.exe | Select-Object -First 1 -ExpandProperty FullName)
 }
 
 function Set-RcloneR2Env {
@@ -90,19 +89,6 @@ function Set-RcloneR2Env {
   $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
   $env:RCLONE_CONFIG_R2_REGION = "auto"
   $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
-
-  $confText = @(
-    "[r2]",
-    "type = s3",
-    "provider = Cloudflare",
-    "access_key_id = $($env:R2_ACCESS_KEY_ID)",
-    "secret_access_key = $($env:R2_SECRET_ACCESS_KEY)",
-    "endpoint = $($env:R2_ENDPOINT)",
-    "region = auto",
-    "no_check_bucket = true"
-  ) -join "`r`n"
-  [IO.File]::WriteAllText($ConfPath, $confText + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
-  & icacls.exe $ConfPath /inheritance:r /grant:r "SYSTEM:(F)" "Administrators:(F)" "${env:USERNAME}:(F)" 2>$null | Out-Null
 }
 
 function Get-RemoteRoot {
@@ -111,186 +97,222 @@ function Get-RemoteRoot {
   return "r2:$($env:R2_BUCKET)"
 }
 
-function Invoke-RcloneRc {
-  # Direct call: vfs/stats and vfs/forget return immediately.
-  param([string[]]$RcArgs)
-  $exe = Get-RcloneExe
+function Get-RemoteFiles {
+  $rclone = Get-RcloneExe
+  $remote = Get-RemoteRoot
   $old = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
-    # rc prints JSON by default; --json means INPUT json and errors if bare.
-    $out = & $exe rc @RcArgs --rc-addr $RcAddr 2>&1
-    return @($out | Where-Object { [string]$_ -notmatch "NOTICE" })
+    $out = & $rclone lsf $remote --max-depth 1 2>&1
+    if ($LASTEXITCODE -ne 0) { return @() }
+    return @($out | Where-Object { $_ -and ([string]$_ -notmatch "NOTICE|ERROR") } | ForEach-Object { ([string]$_).Trim() })
   } finally {
     $ErrorActionPreference = $old
   }
 }
 
-function Invoke-RcloneRcWithTimeout {
-  # mount/unmount can block on Windows; give it a hard ceiling in a child process.
-  param([string[]]$RcArgs, [int]$TimeoutSec = 60)
-  $exe = Get-RcloneExe
-  $outFile = Join-Path $Work "rc-out.txt"
-  if (Test-Path $outFile) { Remove-Item $outFile -Force -ErrorAction SilentlyContinue }
-  $argLine = (@("rc") + $RcArgs + @("--rc-addr", $RcAddr)) -join " "
-  $p = Start-Process -FilePath $exe -ArgumentList $argLine -PassThru -WindowStyle Hidden `
-    -RedirectStandardOutput $outFile -RedirectStandardError "$outFile.err"
-  $done = $p.WaitForExit($TimeoutSec * 1000)
-  if (-not $done) {
-    try { $p.Kill() } catch {}
-    Write-Host ("e-disk: rc timed out after {0}s: {1}" -f $TimeoutSec, ($RcArgs -join " "))
-    return @()
+function Mount-VhdAsDrive([string]$VhdPath, [string]$DriveLetter) {
+  $mimg = Mount-DiskImage -ImagePath $VhdPath -PassThru
+  $mdisk = $mimg | Get-Disk
+  if ($mdisk.IsOffline) {
+    Set-Disk -Number $mdisk.Number -IsOffline $false
   }
-  if (Test-Path $outFile) {
-    return @(Get-Content $outFile -Raw -ErrorAction SilentlyContinue)
+  if ($mdisk.IsReadOnly) {
+    Set-Disk -Number $mdisk.Number -IsReadOnly $false
   }
-  return @()
+  $mpart = Get-Partition -DiskNumber $mdisk.Number -ErrorAction SilentlyContinue |
+    Where-Object { $_.Type -ne "Reserved" -and $_.Size -gt 100MB } |
+    Select-Object -First 1
+  if (-not $mpart) {
+    $mpart = Get-Partition -DiskNumber $mdisk.Number -ErrorAction SilentlyContinue | Select-Object -Last 1
+  }
+  if (-not $mpart) {
+    throw "e-disk: no partition found on mounted VHDX $VhdPath"
+  }
+  if ([string]$mpart.DriveLetter -ne $DriveLetter) {
+    Set-Partition -DiskNumber $mdisk.Number -PartitionNumber $mpart.PartitionNumber -NewDriveLetter $DriveLetter
+  }
 }
 
 function Invoke-Mount {
   Set-RcloneR2Env
-  Install-WinFsp
   Save-BootBaseline
-  $exe = Get-RcloneExe
 
   if (Test-Path "${Letter}:\") {
-    Write-Host "e-disk: ${Letter}: already mapped"
+    Write-Host "e-disk: ${Letter}: already mounted"
     return
   }
 
-  New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
-  if (Test-Path $LogPath) { Remove-Item $LogPath -Force -ErrorAction SilentlyContinue }
+  $rclone = Get-RcloneExe
+  $zstd = Get-ZstdExe
+  $remote = Get-RemoteRoot
+  $tBoot = Get-Date
 
-  # 0777 for files and dirs: without the execute bit Windows refuses to launch
-  # .exe/.dll served by the mount ("Access is denied").
-  # s3-chunk-size 64M + concurrency 16 + multi-thread-streams 16 restore full R2 bandwidth (~55-85 MB/s)
-  # and cut Class A PUT requests by 12.6x compared to default 5MiB chunks.
-  $args = @(
-    "mount", (Get-RemoteRoot), "${Letter}:",
-    "--config", $ConfPath,
-    "--vfs-cache-mode", "full",
-    "--cache-dir", $CacheDir,
-    "--vfs-cache-max-size", "40G",
-    "--s3-chunk-size", "64M",
-    "--s3-upload-concurrency", "16",
-    "--multi-thread-streams", "16",
-    "--vfs-read-chunk-size", "32M",
-    "--links",
-    "--dir-cache-time", "10s",
-    "--transfers", "16",
-    "--file-perms", "0777",
-    "--dir-perms", "0777",
-    "--rc", "--rc-addr", $RcAddr,
-    "--log-file", $LogPath,
-    "--log-level", "INFO"
-  )
-  $t0 = Get-Date
-  $up = $false
-  $mode = "system-task"
+  $files = @(Get-RemoteFiles)
+  Write-Host ("e-disk: remote={0} top-level objects: {1}" -f $remote, ($files -join ", "))
 
-  # Mounting as NT AUTHORITY\SYSTEM places E: in \GLOBAL??\E: so both Session 0
-  # (GitHub Actions runner steps) and Session 2 (interactive RDP user desktop)
-  # see the exact same E: drive letter.
-  try {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    $quotedArgs = ($args | ForEach-Object { if ($_ -match "\s") { "`"$_`"" } else { $_ } }) -join " "
-    $action = New-ScheduledTaskAction -Execute $exe -Argument $quotedArgs
-    $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-    Start-ScheduledTask -TaskName $TaskName
-    for ($i = 0; $i -lt 32; $i++) {
-      Start-Sleep -Milliseconds 250
-      if (Test-Path "${Letter}:\") { $up = $true; break }
+  if (Test-Path $DiffVhd) {
+    try { Dismount-DiskImage -ImagePath $DiffVhd -ErrorAction SilentlyContinue | Out-Null } catch {}
+    Remove-Item $DiffVhd -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path $BaseVhd) {
+    try { Dismount-DiskImage -ImagePath $BaseVhd -ErrorAction SilentlyContinue | Out-Null } catch {}
+    Remove-Item $BaseVhd -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path $NeedBaseFlag) { Remove-Item $NeedBaseFlag -Force -ErrorAction SilentlyContinue }
+
+  if ($files -contains "base.vhdx.zst") {
+    # Standard B2 path: download base.vhdx.zst (+ optional diff.vhdx.zst), decompress on local NVMe, attach diff.vhdx
+    $tDown = Get-Date
+    & $rclone copy "$remote/base.vhdx.zst" $Work --local-no-sparse --multi-thread-streams 16 --stats 0
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $BaseZst)) { throw "e-disk: download base.vhdx.zst failed" }
+    $zstMB = (Get-Item $BaseZst).Length / 1MB
+    $downSec = ((Get-Date) - $tDown).TotalSeconds
+    Write-Host ("e-disk: downloaded base.vhdx.zst size={0:N1}MB seconds={1:N2} MBps={2:N1}" -f $zstMB, $downSec, ($zstMB / [Math]::Max($downSec, 0.01)))
+
+    $tDec = Get-Date
+    & $zstd -q -d -T0 -f $BaseZst -o $BaseVhd
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $BaseVhd)) { throw "e-disk: decompress base.vhdx.zst failed" }
+    Remove-Item $BaseZst -Force -ErrorAction SilentlyContinue
+    $rawMB = (Get-Item $BaseVhd).Length / 1MB
+    $decSec = ((Get-Date) - $tDec).TotalSeconds
+    Write-Host ("e-disk: decompressed base.vhdx size={0:N1}MB seconds={1:N2} MBps={2:N1}" -f $rawMB, $decSec, ($rawMB / [Math]::Max($decSec, 0.01)))
+
+    if ($files -contains "diff.vhdx.zst") {
+      $tDiff = Get-Date
+      & $rclone copy "$remote/diff.vhdx.zst" $Work --local-no-sparse --multi-thread-streams 16 --stats 0
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $DiffZst)) { throw "e-disk: download diff.vhdx.zst failed" }
+      $diffZstMB = (Get-Item $DiffZst).Length / 1MB
+      & $zstd -q -d -T0 -f $DiffZst -o $DiffVhd
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $DiffVhd)) { throw "e-disk: decompress diff.vhdx.zst failed" }
+      Remove-Item $DiffZst -Force -ErrorAction SilentlyContinue
+      try {
+        Set-VHD -Path $DiffVhd -ParentPath $BaseVhd -IgnoreIdMismatch -ErrorAction SilentlyContinue
+      } catch {}
+      Write-Host ("e-disk: restored diff.vhdx.zst ({0:N1}MB) in {1:N2}s" -f $diffZstMB, ((Get-Date) - $tDiff).TotalSeconds)
+    } else {
+      New-VHD -ParentPath $BaseVhd -Path $DiffVhd -Differencing | Out-Null
+      Write-Host "e-disk: created new differencing VHDX on top of base.vhdx"
     }
-  } catch {
-    Write-Host "e-disk: system task mount attempt failed: $_"
+  } elseif ($files -contains "e.vhdx") {
+    # Automatic migration from legacy uncompressed e.vhdx -> base.vhdx.zst on next save
+    Write-Host "e-disk: migrating legacy e.vhdx from R2 to base.vhdx.zst architecture"
+    $tDown = Get-Date
+    $legacyPath = Join-Path $Work "e.vhdx"
+    & $rclone copy "$remote/e.vhdx" $Work --local-no-sparse --multi-thread-streams 16 --stats 0
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $legacyPath)) { throw "e-disk: download legacy e.vhdx failed" }
+    Move-Item $legacyPath $BaseVhd -Force
+    & fsutil sparse setflag $BaseVhd 0 2>$null | Out-Null
+    $rawMB = (Get-Item $BaseVhd).Length / 1MB
+    $downSec = ((Get-Date) - $tDown).TotalSeconds
+    Write-Host ("e-disk: downloaded legacy e.vhdx size={0:N1}MB seconds={1:N2}" -f $rawMB, $downSec)
+    Set-Content -Path $NeedBaseFlag -Value "migrated_from_evhdx" -Encoding UTF8
+  } else {
+    # Brand-new 100GB dynamic VHDX
+    Write-Host "e-disk: initializing fresh 100GB dynamic base.vhdx"
+    New-VHD -Path $BaseVhd -SizeBytes 100GB -Dynamic | Out-Null
+    $img = Mount-DiskImage -ImagePath $BaseVhd -PassThru
+    $disk = $img | Get-Disk
+    Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru |
+      New-Partition -UseMaximumSize -DriveLetter $Letter |
+      Format-Volume -FileSystem NTFS -NewFileSystemLabel "persist" -Confirm:$false | Out-Null
+    Dismount-DiskImage -ImagePath $BaseVhd | Out-Null
+    Start-Sleep -Seconds 1
+    Set-Content -Path $NeedBaseFlag -Value "fresh_base" -Encoding UTF8
   }
 
-  if (-not $up) {
-    $mode = "process-fallback"
-    Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList $args
-    for ($i = 0; $i -lt 240; $i++) {
-      Start-Sleep -Milliseconds 250
-      if (Test-Path "${Letter}:\") { $up = $true; break }
-      if ($proc.HasExited) { break }
-    }
-  }
-
-  $sec = ((Get-Date) - $t0).TotalSeconds
-  Write-Host ("e-disk: ${Letter}: visible={0} mode={1} seconds={2:N2}" -f $up, $mode, $sec)
-  if (-not $up) {
-    if (Test-Path $LogPath) { Get-Content $LogPath -Tail 40 -ErrorAction SilentlyContinue | Out-Host }
-    throw "e-disk: ${Letter}: did not mount"
-  }
-}
-
-function Wait-VfsDrained {
-  param([int]$TimeoutSec = 2400)
-  $t0 = Get-Date
-  $lastLog = -1
-  while ($true) {
-    $json = (Invoke-RcloneRc -RcArgs @("vfs/stats")) -join ""
-    $pending = -1
-    $inflight = -1
-    if ($json -match '"uploadsQueued"\s*:\s*(\d+)') { $pending = [int]$Matches[1] }
-    if ($json -match '"uploadsInProgress"\s*:\s*(\d+)') { $inflight = [int]$Matches[1] }
-    if ($pending -eq 0 -and $inflight -eq 0) { return $true }
-    if ($pending -lt 0 -and $inflight -lt 0) {
-      $head = if ($json.Length -gt 300) { $json.Substring(0, 300) } else { $json }
-      Write-Host ("e-disk: vfs/stats unreadable, cannot confirm drain: " + $head)
-      return $false
-    }
-    $el = [int]((Get-Date) - $t0).TotalSeconds
-    if ($el -gt $TimeoutSec) {
-      Write-Host ("e-disk: drain timeout pending={0} inflight={1} elapsed={2}s" -f $pending, $inflight, $el)
-      return $false
-    }
-    if ([Math]::Floor($el / 15) -ne $lastLog) {
-      $lastLog = [Math]::Floor($el / 15)
-      Write-Host ("e-disk: draining pending={0} inflight={1} elapsed={2}s" -f $pending, $inflight, $el)
-    }
-    Start-Sleep -Seconds 2
-  }
+  $targetVhd = if (Test-Path $DiffVhd) { $DiffVhd } else { $BaseVhd }
+  $tMnt = Get-Date
+  Mount-VhdAsDrive -VhdPath $targetVhd -DriveLetter $Letter
+  $mntSec = ((Get-Date) - $tMnt).TotalSeconds
+  $totSec = ((Get-Date) - $tBoot).TotalSeconds
+  $up = Test-Path "${Letter}:\"
+  Write-Host ("e-disk: ${Letter}: visible={0} vhd={1} mode=vhdx-zstd-diff mount_sec={2:N2} total_sec={3:N2}" -f $up, (Split-Path $targetVhd -Leaf), $mntSec, $totSec)
+  if (-not $up) { throw "e-disk: ${Letter}: failed to mount" }
 }
 
 function Invoke-Save {
   Set-RcloneR2Env
-  if (-not (Test-Path "${Letter}:\")) {
-    Write-Host "e-disk: ${Letter}: not mounted, nothing to flush"
+  $rclone = Get-RcloneExe
+  $zstd = Get-ZstdExe
+  $remote = Get-RemoteRoot
+  $tSave = Get-Date
+
+  if (Test-Path "${Letter}:\") {
+    try { Write-VolumeCache -DriveLetter $Letter -ErrorAction SilentlyContinue } catch {}
+  }
+
+  if (Test-Path $DiffVhd) {
+    try { Dismount-DiskImage -ImagePath $DiffVhd -ErrorAction SilentlyContinue | Out-Null } catch {}
+  }
+  if (Test-Path $BaseVhd) {
+    try { Dismount-DiskImage -ImagePath $BaseVhd -ErrorAction SilentlyContinue | Out-Null } catch {}
+  }
+
+  for ($i = 0; $i -lt 20; $i++) {
+    if (-not (Test-Path "${Letter}:\")) { break }
+    Start-Sleep -Milliseconds 250
+  }
+  if (Test-Path "${Letter}:\") {
+    throw "e-disk: ${Letter}: still mounted after Dismount-DiskImage"
+  }
+
+  if (-not (Test-Path $DiffVhd) -and -not (Test-Path $BaseVhd)) {
+    Write-Host "e-disk: no local VHDX found to save"
     return
   }
 
-  Write-Host "e-disk: waiting for pending uploads to finish"
-  $t0 = Get-Date
-  $drained = Wait-VfsDrained -TimeoutSec 2400
-  Write-Host ("e-disk: drained={0} seconds={1:N1}" -f $drained, ((Get-Date) - $t0).TotalSeconds)
-  if (-not $drained) {
-    # Killing rclone here loses pending writes; fail loudly instead.
-    throw "e-disk: uploads did not finish, refusing to unmount"
-  }
+  $mergeThresholdGB = if ($env:E_DIFF_MERGE_GB) { [double]$env:E_DIFF_MERGE_GB } else { 3.0 }
+  $diffBytes = if (Test-Path $DiffVhd) { (Get-Item $DiffVhd).Length } else { 0 }
+  $doBaseMerge = (Test-Path $NeedBaseFlag) -or ($env:E_FORCE_BASE_MERGE -eq "1") -or ($diffBytes -ge ($mergeThresholdGB * 1GB))
 
-  # rc mount/unmount never releases a WinFsp drive in our tests; killing the
-  # process is safe once every upload has drained to R2.
-  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-  Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
-  $gone = $false
-  for ($i = 0; $i -lt 60; $i++) {
-    Start-Sleep -Milliseconds 250
-    if (-not (Test-Path "${Letter}:\")) { $gone = $true; break }
-  }
-  if (-not $gone) {
+  if ($doBaseMerge) {
+    $reason = if (Test-Path $NeedBaseFlag) { (Get-Content $NeedBaseFlag -Raw).Trim() } elseif ($env:E_FORCE_BASE_MERGE -eq "1") { "forced" } else { "diff_threshold_exceeded" }
+    Write-Host ("e-disk: merging diff.vhdx ({0:N1}MB) into base.vhdx (reason={1})" -f ($diffBytes / 1MB), $reason)
+    if (Test-Path $DiffVhd) {
+      Merge-VHD -Path $DiffVhd -DestinationPath $BaseVhd
+      Remove-Item $DiffVhd -Force -ErrorAction SilentlyContinue
+    }
+    $rawBytes = (Get-Item $BaseVhd).Length
+    $rawMB = $rawBytes / 1MB
+    $tComp = Get-Date
+    & $zstd -q -1 -T0 -f $BaseVhd -o $BaseZst
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $BaseZst)) { throw "e-disk: zstd compress base.vhdx failed" }
+    $compSec = ((Get-Date) - $tComp).TotalSeconds
+    $zstBytes = (Get-Item $BaseZst).Length
+    $zstMB = $zstBytes / 1MB
+    Write-Host ("e-disk: compressed base.vhdx raw={0:N1}MB -> zst={1:N1}MB ({2:P1}) in {3:N2}s ({4:N1} MB/s)" -f $rawMB, $zstMB, ($zstBytes / [double][Math]::Max($rawBytes, 1)), $compSec, ($rawMB / [Math]::Max($compSec, 0.01)))
+
+    $tUp = Get-Date
+    & $rclone copyto $BaseZst "$remote/base.vhdx.zst" --s3-chunk-size 64M --s3-upload-concurrency 16 --stats 0
+    if ($LASTEXITCODE -ne 0) { throw "e-disk: rclone upload base.vhdx.zst failed" }
+    $upSec = ((Get-Date) - $tUp).TotalSeconds
+    Remove-Item $BaseZst -Force -ErrorAction SilentlyContinue
+    if (Test-Path $NeedBaseFlag) { Remove-Item $NeedBaseFlag -Force -ErrorAction SilentlyContinue }
+
     $old = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    & cmd.exe /c "rmdir ${Letter}:" 2>&1 | Out-Null
+    & $rclone deletefile "$remote/diff.vhdx.zst" 2>$null | Out-Null
     $ErrorActionPreference = $old
-    Start-Sleep -Seconds 2
-    $gone = -not (Test-Path "${Letter}:\")
+
+    Write-Host ("e-disk: uploaded base.vhdx.zst ({0:N1}MB) in {1:N2}s ({2:N1} MB/s), total_save={3:N2}s" -f $zstMB, $upSec, ($zstMB / [Math]::Max($upSec, 0.01)), ((Get-Date) - $tSave).TotalSeconds)
+  } else {
+    $rawMB = $diffBytes / 1MB
+    $tComp = Get-Date
+    & $zstd -q -1 -T0 -f $DiffVhd -o $DiffZst
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $DiffZst)) { throw "e-disk: zstd compress diff.vhdx failed" }
+    $compSec = ((Get-Date) - $tComp).TotalSeconds
+    $zstBytes = (Get-Item $DiffZst).Length
+    $zstMB = $zstBytes / 1MB
+    Write-Host ("e-disk: compressed diff.vhdx raw={0:N1}MB -> zst={1:N1}MB ({2:P1}) in {3:N2}s ({4:N1} MB/s)" -f $rawMB, $zstMB, ($zstBytes / [double][Math]::Max($diffBytes, 1)), $compSec, ($rawMB / [Math]::Max($compSec, 0.01)))
+
+    $tUp = Get-Date
+    & $rclone copyto $DiffZst "$remote/diff.vhdx.zst" --s3-chunk-size 64M --s3-upload-concurrency 16 --stats 0
+    if ($LASTEXITCODE -ne 0) { throw "e-disk: rclone upload diff.vhdx.zst failed" }
+    $upSec = ((Get-Date) - $tUp).TotalSeconds
+    Remove-Item $DiffZst -Force -ErrorAction SilentlyContinue
+    Write-Host ("e-disk: uploaded diff.vhdx.zst ({0:N1}MB) in {1:N2}s ({2:N1} MB/s), total_save={3:N2}s" -f $zstMB, $upSec, ($zstMB / [Math]::Max($upSec, 0.01)), ((Get-Date) - $tSave).TotalSeconds)
   }
-  Write-Host ("e-disk: unmounted={0} seconds={1:N2}" -f $gone, ((Get-Date) - $t0).TotalSeconds)
-  if (-not $gone) { throw "e-disk: ${Letter}: still mounted after flush" }
 }
 
 if ($Action -eq "mount") { Invoke-Mount } else { Invoke-Save }
