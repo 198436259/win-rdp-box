@@ -78,15 +78,31 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
+          $log = Join-Path $env:RUNNER_TEMP "mount-trace.log"
+          Start-Transcript -Path $log -Force | Out-Null
+          $t = Get-Date
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
-          Write-Host ("RESULT e_present={0}" -f (Test-Path "E:\"))
+          Write-Host ("RESULT e_present={0} seconds={1:N1}" -f (Test-Path "E:\"), ((Get-Date) - $t).TotalSeconds)
           if (Test-Path "E:\") {
             powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action restore *>&1 | Out-Host
-            $i = Get-Item "C:\Program Files\7-Zip" -Force -ErrorAction SilentlyContinue
+            $i = Get-Item "C:\Program Files\a-Zip" -Force -ErrorAction SilentlyContinue
             Write-Host ("RESULT junction_type={0}" -f ($(if ($i) { $i.LinkType } else { "gone" })))
-            Write-Host ("RESULT app_exe_present={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
+            Write-Host ("RESULT app_exe_present={0}" -f (Test-Path "C:\Program Files\a-Zip\az.exe"))
           }
-          "E mounted. Look at E:\ and C:\Program Files\7-Zip." | Set-Content -Path "$env:USERPROFILE\Desktop\LOOK-HERE.txt" -Encoding UTF8
+          Stop-Transcript | Out-Null
+          $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
+          if ($txt.Length -gt 20000) { $txt = $txt.Substring($txt.Length - 20000) }
+          $b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($txt))
+          $pf = Join-Path $env:RUNNER_TEMP "trace.json"
+          $json = (@{ message = "see-it trace"; content = $b } | ConvertTo-Json -Compress)
+          [IO.File]::WriteAllText($pf, $json, (New-Object Text.UTF8Encoding($false)))
+          & curl.exe -sS -o NUL -w "trace http=%{http_code}`n" -X PUT `
+            -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
+            -H "Accept: application/vnd.github+json" `
+            -H "Content-Type: application/json" `
+            --data-binary "@$pf" `
+            "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/.box/see-trace-$($env:GITHUB_RUN_ID).txt"
+          "Look at E:\ and C:\Program Files\a-Zip." | Set-Content -Path "$env:USERPROFILE\Desktop\LOOK-HERE.txt" -Encoding UTF8
           Write-Host "=== NOW LOG IN VIA RDP ==="
           Write-Host "Holding 100 minutes..."
           Start-Sleep -Seconds 6000
