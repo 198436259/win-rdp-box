@@ -76,6 +76,8 @@ jobs:
           Start-Sleep -Seconds 5
           & cmd.exe /c "rmdir E:" 2>$null | Out-Null
           Write-Host ("RESULT mountA_down={0}" -f (-not (Test-Path "E:\")))
+          # native stderr / rmdir exit codes must not fail the step; assertions are in RESULT lines
+          exit 0
 
       - name: "3 mount WITH file-perms 0777 and test exec"
         shell: powershell
@@ -129,6 +131,7 @@ jobs:
           Set-Content (Join-Path $tmp "a.txt") "hello"
           & $link"\7z.exe" a (Join-Path $tmp "a.zip") (Join-Path $tmp "a.txt") 2>&1 | Out-Null
           Write-Host ("RESULT B_zip_via_junction={0}" -f (Test-Path (Join-Path $tmp "a.zip")))
+          exit 0
 
       - name: "4 write through mount and verify in r2"
         shell: powershell
@@ -151,3 +154,4 @@ jobs:
           Write-Host ("RESULT r2_write_back={0}" -f ((@($txt) -join "") -like "*probe wrote this*"))
           & $exe delete "r2:$($env:R2_BUCKET)/apps/ProgramFiles/7-Zip/written-by-probe.txt" 2>$null | Out-Null
           Write-Host "APPS_JUNCTION_DONE"
+          exit 0
