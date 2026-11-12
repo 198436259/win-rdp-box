@@ -1,0 +1,84 @@
+name: r2-save25-truth
+on: workflow_dispatch
+jobs:
+  save:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_E_PREFIX: size25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "write 24GB through production mount, then production save, verify exact size in r2"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          function G([string]$n, [double]$s, [double]$mb) {
+            $r = if ($s -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
+          }
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+          Write-Host ("GAUGE mount seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          Write-Host ("RESULT mounted={0}" -f (Test-Path "E:\"))
+          if (-not (Test-Path "E:\")) { Write-Host "MOUNT_FAILED"; exit 0 }
+
+          $target = [long](24GB)
+          Write-Host ("writing {0} bytes to E:\written24.bin" -f $target)
+          $t = Get-Date
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(3).NextBytes($buf)
+          $out = [IO.File]::Open("E:\written24.bin", "Create", "Write", "None")
+          $wrote = [long]0
+          while ($wrote -lt $target) {
+            $c = [int][Math]::Min([long]$buf.Length, ($target - $wrote))
+            $out.Write($buf, 0, $c)
+            $wrote += $c
+            if (($wrote % 4GB) -lt $buf.Length) {
+              $el = ((Get-Date) - $t).TotalSeconds
+              Write-Host ("write {0:N1} GB {1:N1} MBps" -f ($wrote/1GB), (($wrote/1MB)/$el))
+            }
+          }
+          $out.Close()
+          G "write_24gb_to_cache" ((Get-Date) - $t).TotalSeconds ($wrote / 1MB)
+
+          Write-Host "=== PRODUCTION SAVE (drain 24GB to r2) ==="
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
+          $saveSec = ((Get-Date) - $t).TotalSeconds
+          G "save_24gb_total" $saveSec ($target / 1MB)
+          Write-Host ("RESULT drive_gone={0}" -f (-not (Test-Path "E:\")))
+
+          Write-Host "=== VERIFY EXACT SIZE IN R2 ==="
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+          $json = (& $exe lsjson "r2:$($env:R2_BUCKET)/size25" 2>$null | Out-String)
+          try {
+            $items = $json | ConvertFrom-Json
+            foreach ($it in @($items)) {
+              if ($it.Name -eq "written24.bin") {
+                Write-Host ("RESULT r2_written24_size={0}" -f $it.Size)
+                Write-Host ("RESULT exact_match={0}" -f ([long]$it.Size -eq $target))
+              }
+            }
+          } catch {
+            Write-Host ("RESULT r2_parse_failed=" + $json.Substring(0, [Math]::Min(200, $json.Length)))
+          }
+          & $exe delete "r2:$($env:R2_BUCKET)/size25/written24.bin" 2>$null | Out-Null
+          Write-Host "SAVE25_TRUTH_DONE"
+          exit 0
