@@ -32,7 +32,8 @@ jobs:
       - name: "2 upload app folder to r2 and replace with junction"
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          # rclone writes NOTICE to stderr; Stop turns that into a fatal error.
+          $ErrorActionPreference = "Continue"
           $exe = Get-ChildItem (Join-Path $env:RUNNER_TEMP "rclone") -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
           $env:RCLONE_CONFIG_R2_TYPE = "s3"
           $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
