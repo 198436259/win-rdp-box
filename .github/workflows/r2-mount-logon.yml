@@ -1,0 +1,130 @@
+name: r2-mount-logon
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      RDP_PASS: ${{ secrets.RDP_PASS }}
+      SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+      SNAPSHOT_TOKEN: ${{ secrets.SNAPSHOT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: enable rdp
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $pw = $env:RDP_PASS
+          if (-not $pw) { $pw = "Runner123" }
+          net user runneradmin $pw 2>&1 | Out-Host
+          net localgroup administrators runneradmin /add 2>&1 | Out-Host
+          net localgroup "Remote Desktop Users" runneradmin /add 2>&1 | Out-Host
+          $ErrorActionPreference = "Stop"
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fSingleSessionPerUser" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service TermService -Force
+          Start-Sleep -Seconds 3
+          Write-Host "rdp enabled"
+
+      - name: start ngrok and publish
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = Join-Path $env:RUNNER_TEMP "ngrok"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "ngrok.zip"
+          curl.exe -fsSL -o $zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $ngrok = Join-Path $dir "ngrok.exe"
+          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+          Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
+          $url = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $log) {
+              $m = Select-String -Path $log -Pattern "url=(tcp://[^ ]+)" | Select-Object -Last 1
+              if ($m) { $url = $m.Matches[0].Groups[1].Value; break }
+            }
+          }
+          if (-not $url) { throw "ngrok url not found" }
+          $port = ($url -split ":")[-1]
+          $hostName = ($url -replace "^tcp://","" -split ":")[0]
+          Write-Host ("CONNECT host={0} port={1}" -f $hostName, $port)
+          $body = "host=$hostName`nport=$port`npass=$env:RDP_PASS`n"
+          $b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+          $pf = Join-Path $env:RUNNER_TEMP "pub.json"
+          $json1 = (@{ message = "logon probe $($env:GITHUB_RUN_ID)"; content = $b } | ConvertTo-Json -Compress)
+          [IO.File]::WriteAllText($pf, $json1, (New-Object Text.UTF8Encoding($false)))
+          & curl.exe -sS -o NUL -w "publish http=%{http_code}`n" -X PUT `
+            -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
+            -H "Accept: application/vnd.github+json" `
+            -H "Content-Type: application/json" `
+            --data-binary "@$pf" `
+            "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/.box/logon-probe-$($env:GITHUB_RUN_ID).txt"
+
+      - name: install winfsp and register logon task
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $conf = "C:\rcloneconf"
+          New-Item -ItemType Directory -Force -Path $conf | Out-Null
+
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
+          curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          Write-Host ("winfsp exit={0}" -f $p.ExitCode)
+
+          $rdir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $rdir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $rdir -Force
+          $found = Get-ChildItem $rdir -Recurse -Filter rclone.exe | Select-Object -First 1
+          Copy-Item $found.FullName (Join-Path $conf "rclone.exe") -Force
+
+          $confText = "[r2]`ntype = s3`nprovider = Cloudflare`naccess_key_id = $env:R2_ACCESS_KEY_ID`nsecret_access_key = $env:R2_SECRET_ACCESS_KEY`nendpoint = $env:R2_ENDPOINT`nregion = auto`nno_check_bucket = true`n"
+          [IO.File]::WriteAllText((Join-Path $conf "rclone.conf"), $confText)
+
+          $exe = Join-Path $conf "rclone.exe"
+          $argText = "mount r2:$($env:R2_BUCKET) E: --config `"$conf\rclone.conf`" --vfs-cache-mode full --dir-cache-time 10s --log-file `"$conf\mount.log`" --log-level INFO"
+          [IO.File]::WriteAllText((Join-Path $conf "mount.cmd"), "@echo off`r`n`"$exe`" $argText`r`n")
+
+          $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$conf\mount.cmd`""
+          $trigger = New-ScheduledTaskTrigger -AtLogOn -User "runneradmin"
+          $principal = New-ScheduledTaskPrincipal -UserId "runneradmin" -LogonType Interactive -RunLevel Highest
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+          Register-ScheduledTask -TaskName "RcloneMountE" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+          Write-Host "registered scheduled task RcloneMountE (AtLogOn runneradmin)"
+
+          $task = Get-ScheduledTask -TaskName "RcloneMountE" -ErrorAction SilentlyContinue
+          Write-Host ("task state={0}" -f ($(if ($task) { $task.State } else { "missing" })))
+
+          $res = "task=registered trigger=AtLogOn user=runneradmin"
+          $rb = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($res + "`n"))
+          $rf = Join-Path $env:RUNNER_TEMP "res.json"
+          $json2 = (@{ message = "logon probe result"; content = $rb } | ConvertTo-Json -Compress)
+          [IO.File]::WriteAllText($rf, $json2, (New-Object Text.UTF8Encoding($false)))
+          & curl.exe -sS -o NUL -w "result http=%{http_code}`n" -X PUT `
+            -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
+            -H "Accept: application/vnd.github+json" `
+            -H "Content-Type: application/json" `
+            --data-binary "@$rf" `
+            "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/.box/logon-result-$($env:GITHUB_RUN_ID).txt"
+
+          Write-Host "=== NOW LOG IN VIA RDP ==="
+          Write-Host "In that RDP window run:"
+          Write-Host "  Test-Path E:\ ; Get-ChildItem E:\ ; Get-Content C:\rcloneconf\mount.log -Tail 20"
+          Write-Host "Holding 25 minutes..."
+          Start-Sleep -Seconds 1500
+          Write-Host "LOGON_PROBE_DONE"
