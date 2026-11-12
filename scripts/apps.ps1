@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("save", "restore")]
+  [ValidateSet("save", "restore", "link")]
   [string]$Action
 )
 
@@ -144,6 +144,7 @@ function Invoke-Save {
     foreach ($c in $children) {
       if ($SkipNames -contains $c.Name) { continue }
       if (Test-IsJunction $c.FullName) { continue }
+      if ($env:APPS_ONLY -and $c.Name -ne $env:APPS_ONLY) { continue }
 
       $remote = (Get-RemoteRoot) + "/$($root.Remote)/$($c.Name)"
       $t0 = Get-Date
@@ -189,6 +190,24 @@ function Invoke-Save {
   Write-Manifest @($byPath.Values)
 }
 
+function Invoke-Link {
+  Set-RcloneR2Env
+  if (-not (Test-Path "${Letter}:\")) { throw "apps: ${Letter}: not mounted" }
+  $name = $env:APPS_ONLY
+  if (-not $name) { throw "apps: APPS_ONLY missing" }
+  foreach ($root in $Roots) {
+    $local = Join-Path $root.Path $name
+    if (-not (Test-Path $local)) { continue }
+    if (Test-IsJunction $local) { Write-Host "apps: already linked $local"; continue }
+    $target = Join-Path ("${Letter}:\" + $root.Remote) $name
+    if (-not (Test-Path $target)) { Write-Host "apps: target missing $target"; continue }
+    if (-not (Remove-LocalDir $local)) { continue }
+    if (New-Junction $local $target) {
+      Write-Host ("apps: junctioned {0} -> {1}" -f $local, $target)
+    }
+  }
+}
+
 function Invoke-Restore {
   Set-RcloneR2Env
   if (-not (Test-Path "${Letter}:\")) { throw "apps: ${Letter}: not mounted" }
@@ -220,4 +239,4 @@ function Invoke-Restore {
   Write-Host ("apps: restore ok={0} fail={1}" -f $ok, $fail)
 }
 
-if ($Action -eq "save") { Invoke-Save } else { Invoke-Restore }
+if ($Action -eq "save") { Invoke-Save } elseif ($Action -eq "link") { Invoke-Link } else { Invoke-Restore }
