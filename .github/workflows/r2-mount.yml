@@ -14,7 +14,6 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          function W([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f n) }
           function Step([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f $n) }
 
           Step "1 INSTALL WINFSP"
