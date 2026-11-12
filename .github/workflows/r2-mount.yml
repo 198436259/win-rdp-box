@@ -1,0 +1,116 @@
+name: r2-mount
+on: workflow_dispatch
+jobs:
+  mount:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: can R2 be mounted as a drive letter instead of downloaded
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          function W([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f n) }
+          function Step([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f $n) }
+
+          Step "1 INSTALL WINFSP"
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
+          curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+          Write-Host ("msi bytes={0}" -f (Get-Item $msi).Length)
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          Write-Host ("winfsp install exit={0}" -f $p.ExitCode)
+          $svc = Get-Service winfsp -ErrorAction SilentlyContinue
+          Write-Host ("winfsp service={0}" -f ($(if ($svc) { $svc.Status } else { "missing" })))
+
+          Step "2 RCLONE"
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          Step "3 SEED A FEW FILES IN A TEST PREFIX"
+          $src = "D:\seed"
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          1..5 | ForEach-Object {
+            $f = Join-Path $src ("file{0}.txt" -f $_)
+            Set-Content -Path $f -Value ("hello {0} " -f $_) -Encoding UTF8
+          }
+          $big = Join-Path $src "big100mb.bin"
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(5).NextBytes($buf)
+          $fs = [IO.File]::Open($big, "Create", "Write", "None")
+          try { 1..13 | ForEach-Object { $fs.Write($buf, 0, $buf.Length) } } finally { $fs.Close() }
+          & $exe copy $src "r2:$($env:R2_BUCKET)/mountseed/" --stats 0
+          if ($LASTEXITCODE -ne 0) { throw "seed upload failed" }
+          & $exe ls "r2:$($env:R2_BUCKET)/mountseed/"
+
+          Step "4 MOUNT AS E:"
+          $log = "D:\rclone-mount.log"
+          $proc = Start-Process -FilePath $exe -ArgumentList @(
+            "mount", "r2:$($env:R2_BUCKET)/mountseed", "E:",
+            "--vfs-cache-mode", "full",
+            "--dir-cache-time", "10s",
+            "--log-file", $log,
+            "--log-level", "INFO"
+          ) -PassThru -WindowStyle Hidden
+          Write-Host ("mount pid={0}" -f $proc.Id)
+
+          $appeared = $false
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-Path "E:\") { $appeared = $true; break }
+          }
+          Write-Host ("RESULT drive_appeared={0} after_ms={1}" -f $appeared, ($i * 500))
+
+          if ($appeared) {
+            Step "5 LIST + TIME FIRST READ"
+            $t = Get-Date
+            $names = @(Get-ChildItem "E:\" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+            Write-Host ("RESULT list_seconds={0:N2} count={1} names={2}" -f ((Get-Date) - $t).TotalSeconds, $names.Count, ($names -join ","))
+
+            $t = Get-Date
+            $content = Get-Content "E:\file1.txt" -Raw -ErrorAction SilentlyContinue
+            Write-Host ("RESULT read_small_seconds={0:N2} content={1}" -f ((Get-Date) - $t).TotalSeconds, $content.Trim())
+
+            $t = Get-Date
+            $len = (Get-Item "E:\big100mb.bin" -ErrorAction SilentlyContinue).Length
+            Write-Host ("RESULT stat_big_seconds={0:N2} length={1}" -f ((Get-Date) - $t).TotalSeconds, $len)
+
+            $t = Get-Date
+            $h = (Get-FileHash "E:\big100mb.bin" -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+            $s = ((Get-Date) - $t).TotalSeconds
+            $mb = if ($len) { $len / 1MB } else { 104 }
+            Write-Host ("RESULT read_big_seconds={0:N1} MBps={1:N1} hash={2}" -f $s, ($mb / $s), $h)
+
+            Step "6 WRITE THEN READ BACK"
+            Set-Content -Path "E:\mounted-write.txt" -Value "written at $(Get-Date -Format o)" -Encoding UTF8
+            Start-Sleep -Seconds 2
+            Write-Host ("RESULT write_readback={0}" -f (Get-Content "E:\mounted-write.txt" -Raw -ErrorAction SilentlyContinue).Trim())
+            & $exe lsl "r2:$($env:R2_BUCKET)/mountseed/mounted-write.txt"
+          } else {
+            Write-Host "RESULT mount failed"
+            if (Test-Path $log) { Get-Content $log -Tail 40 | Write-Host }
+          }
+
+          Step "7 UNMOUNT + CLEANUP"
+          if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          Start-Sleep -Seconds 2
+          $old = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          & $exe purge "r2:$($env:R2_BUCKET)/mountseed/" 2>&1 | Out-Host
+          $ErrorActionPreference = $old
+          Write-Host "MOUNT_TEST_DONE"
