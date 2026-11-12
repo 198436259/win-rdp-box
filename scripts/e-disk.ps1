@@ -19,6 +19,39 @@ $Work = Get-WorkRoot
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 $LogPath = Join-Path $Work "mount.log"
 $CacheDir = Join-Path $Work "vfs-cache"
+$ConfPath = Join-Path $Work "rclone.conf"
+$BaselinePath = Join-Path $Work "boot-baseline.json"
+$TaskName = "FlexPCRcloneMountE"
+
+function Save-BootBaseline {
+  if (Test-Path $BaselinePath) { return }
+  $pf = @()
+  $pfx86 = @()
+  $pd = @()
+  if (Test-Path "C:\Program Files") {
+    $pf = @(Get-ChildItem "C:\Program Files" -Directory -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.LinkType -ne "Junction" -and $_.LinkType -ne "SymbolicLink" } |
+      Select-Object -ExpandProperty Name)
+  }
+  if (Test-Path "C:\Program Files (x86)") {
+    $pfx86 = @(Get-ChildItem "C:\Program Files (x86)" -Directory -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.LinkType -ne "Junction" -and $_.LinkType -ne "SymbolicLink" } |
+      Select-Object -ExpandProperty Name)
+  }
+  if (Test-Path "C:\ProgramData") {
+    $pd = @(Get-ChildItem "C:\ProgramData" -Directory -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.LinkType -ne "Junction" -and $_.LinkType -ne "SymbolicLink" } |
+      Select-Object -ExpandProperty Name)
+  }
+  $obj = [pscustomobject]@{
+    capturedAt      = [DateTime]::UtcNow.ToString("o")
+    ProgramFiles    = $pf
+    ProgramFilesX86 = $pfx86
+    ProgramData     = $pd
+  }
+  $obj | ConvertTo-Json -Depth 4 | Set-Content -Path $BaselinePath -Encoding UTF8
+  Write-Host ("e-disk: captured boot baseline pf={0} pfx86={1} pd={2}" -f $pf.Count, $pfx86.Count, $pd.Count)
+}
 
 function Get-RcloneExe {
   $dir = Join-Path $Work "rclone"
@@ -57,6 +90,19 @@ function Set-RcloneR2Env {
   $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
   $env:RCLONE_CONFIG_R2_REGION = "auto"
   $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+  $confText = @(
+    "[r2]",
+    "type = s3",
+    "provider = Cloudflare",
+    "access_key_id = $($env:R2_ACCESS_KEY_ID)",
+    "secret_access_key = $($env:R2_SECRET_ACCESS_KEY)",
+    "endpoint = $($env:R2_ENDPOINT)",
+    "region = auto",
+    "no_check_bucket = true"
+  ) -join "`r`n"
+  [IO.File]::WriteAllText($ConfPath, $confText + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+  & icacls.exe $ConfPath /inheritance:r /grant:r "SYSTEM:(F)" "Administrators:(F)" "${env:USERNAME}:(F)" 2>$null | Out-Null
 }
 
 function Get-RemoteRoot {
@@ -102,6 +148,7 @@ function Invoke-RcloneRcWithTimeout {
 }
 
 function Invoke-Mount {
+  Save-BootBaseline
   Set-RcloneR2Env
   Install-WinFsp
   $exe = Get-RcloneExe
@@ -116,11 +163,18 @@ function Invoke-Mount {
 
   # 0777 for files and dirs: without the execute bit Windows refuses to launch
   # .exe/.dll served by the mount ("Access is denied").
+  # s3-chunk-size 64M + concurrency 16 + multi-thread-streams 16 restore full R2 bandwidth (~55-85 MB/s)
+  # and cut Class A PUT requests by 12.6x compared to default 5MiB chunks.
   $args = @(
     "mount", (Get-RemoteRoot), "${Letter}:",
+    "--config", $ConfPath,
     "--vfs-cache-mode", "full",
     "--cache-dir", $CacheDir,
     "--vfs-cache-max-size", "40G",
+    "--s3-chunk-size", "64M",
+    "--s3-upload-concurrency", "16",
+    "--multi-thread-streams", "16",
+    "--vfs-read-chunk-size", "32M",
     "--links",
     "--dir-cache-time", "10s",
     "--transfers", "16",
@@ -131,15 +185,41 @@ function Invoke-Mount {
     "--log-level", "INFO"
   )
   $t0 = Get-Date
-  $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList $args
   $up = $false
-  for ($i = 0; $i -lt 240; $i++) {
-    Start-Sleep -Milliseconds 250
-    if (Test-Path "${Letter}:\") { $up = $true; break }
-    if ($proc.HasExited) { break }
+  $mode = "system-task"
+
+  # Mounting as NT AUTHORITY\SYSTEM places E: in \GLOBAL??\E: so both Session 0
+  # (GitHub Actions runner steps) and Session 2 (interactive RDP user desktop)
+  # see the exact same E: drive letter.
+  try {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    $quotedArgs = ($args | ForEach-Object { if ($_ -match "\s") { "`"$_`"" } else { $_ } }) -join " "
+    $action = New-ScheduledTaskAction -Execute $exe -Argument $quotedArgs
+    $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    Start-ScheduledTask -TaskName $TaskName
+    for ($i = 0; $i -lt 32; $i++) {
+      Start-Sleep -Milliseconds 250
+      if (Test-Path "${Letter}:\") { $up = $true; break }
+    }
+  } catch {
+    Write-Host "e-disk: system task mount attempt failed: $_"
   }
+
+  if (-not $up) {
+    $mode = "process-fallback"
+    Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList $args
+    for ($i = 0; $i -lt 240; $i++) {
+      Start-Sleep -Milliseconds 250
+      if (Test-Path "${Letter}:\") { $up = $true; break }
+      if ($proc.HasExited) { break }
+    }
+  }
+
   $sec = ((Get-Date) - $t0).TotalSeconds
-  Write-Host ("e-disk: ${Letter}: visible={0} seconds={1:N2}" -f $up, $sec)
+  Write-Host ("e-disk: ${Letter}: visible={0} mode={1} seconds={2:N2}" -f $up, $mode, $sec)
   if (-not $up) {
     if (Test-Path $LogPath) { Get-Content $LogPath -Tail 40 -ErrorAction SilentlyContinue | Out-Host }
     throw "e-disk: ${Letter}: did not mount"
@@ -193,6 +273,8 @@ function Invoke-Save {
 
   # rc mount/unmount never releases a WinFsp drive in our tests; killing the
   # process is safe once every upload has drained to R2.
+  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
   Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
   $gone = $false
   for ($i = 0; $i -lt 60; $i++) {
