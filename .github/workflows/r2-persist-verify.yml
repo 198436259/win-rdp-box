@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "save = install app then persist to r2; restore = fresh machine, verify app came back"
+        description: "save = full production save on 25GB E:; restore = fresh machine restore & verify"
         required: true
         default: save
         type: choice
@@ -17,72 +17,151 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-      R2_E_PREFIX: verify2
+      R2_E_PREFIX: size25
     steps:
       - uses: actions/checkout@v4
 
-      - name: "mount E"
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-          $t = Get-Date
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
-          Write-Host ("GAUGE e_mount seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
-          Write-Host ("RESULT e_present={0}" -f (Test-Path "E:\"))
-          if (Test-Path "E:\") {
-            Write-Host ("RESULT e_top=" + ((Get-ChildItem "E:\" | Select-Object -ExpandProperty Name) -join ","))
-          }
-          exit 0
-
-      - name: "save: install app then persist"
+      - name: "save: mount 25GB E, install real exe+ProgramData+C-state, production save (NO APPS_ONLY)"
         if: inputs.mode == 'save'
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          New-Item -ItemType Directory -Force -Path "C:\Program Files\FlexPCProbe" | Out-Null
-          Set-Content -Path "C:\Program Files\FlexPCProbe\probe.ps1" -Value "Write-Output FLEXPC_PROBE_OK" -Encoding UTF8
-          Write-Host ("RESULT probe_installed={0}" -f (Test-Path "C:\Program Files\FlexPCProbe\probe.ps1"))
-          $o = & powershell -NoProfile -File "C:\Program Files\FlexPCProbe\probe.ps1" 2>&1
-          Write-Host ("RESULT probe_runs_local={0}" -f (($o -join "") -like "*FLEXPC_PROBE_OK*"))
+          function G([string]$n, [double]$s, [double]$mb = 0) {
+            $r = if ($s -gt 0 -and $mb -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N2} MBps={2:N1}" -f $n, $s, $r)
+          }
 
-          Write-Host "--- apps save (upload + junction) ---"
-          $t = Get-Date
-          $env:APPS_ONLY = "FlexPCProbe"
+          $tBoot = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+          G "e_mount" ((Get-Date) - $tBoot).TotalSeconds
+          Write-Host ("RESULT e_present={0}" -f (Test-Path "E:\"))
+          if (-not (Test-Path "E:\")) { throw "E: not mounted" }
+
+          $bulk = Get-Item "E:\bulk.bin" -ErrorAction SilentlyContinue
+          $bulkGB = if ($bulk) { [Math]::Round($bulk.Length / 1GB, 2) } else { 0 }
+          Write-Host ("RESULT bulk_gb={0}" -f $bulkGB)
+
+          # Check if E: is in Global DOS Devices (\GLOBAL??) via SYSTEM task
+          $rcloneTask = Get-ScheduledTask -TaskName "FlexPCRcloneMountE" -ErrorAction SilentlyContinue
+          Write-Host ("RESULT mount_task_state={0}" -f ($(if ($rcloneTask) { $rcloneTask.State } else { "none" })))
+
+          # 1. Install a real multi-file native binary (7z.exe + 7z.dll) into a new Program Files folder
+          $appDir = "C:\Program Files\FlexPC7Zip"
+          New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+          Copy-Item "C:\Program Files\7-Zip\7z.exe" "$appDir\7z.exe" -Force
+          Copy-Item "C:\Program Files\7-Zip\7z.dll" "$appDir\7z.dll" -Force
+          Set-Content -Path "$appDir\version-marker.txt" -Value "FlexPC-RealExe-20261112" -Encoding UTF8
+
+          # 2. Create ProgramData, Desktop file, Registry key, and User env var
+          New-Item -ItemType Directory -Force -Path "C:\ProgramData\FlexPC7Zip" | Out-Null
+          Set-Content -Path "C:\ProgramData\FlexPC7Zip\config.ini" -Value "persisted_programdata=true" -Encoding UTF8
+          Set-Content -Path "$env:USERPROFILE\Desktop\flexpc-verify.txt" -Value "desktop_alive=true" -Encoding UTF8
+          & reg.exe add "HKCU\Software\Claude" /v "FlexPCVerify" /t REG_SZ /d "reg_alive_2026" /f | Out-Null
+          [System.Environment]::SetEnvironmentVariable("FLEXPC_USER_VAR", "env_alive_2026", "User")
+
+          # 3. Write 512MB new data onto E: to measure 64MiB chunk upload speed during shutdown
+          $tWrite = Get-Date
+          $deltaBytes = [long](512MB)
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(42).NextBytes($buf)
+          $fs = [IO.File]::Open("E:\delta512.bin", "Create", "Write", "None")
+          $w = [long]0
+          while ($w -lt $deltaBytes) {
+            $c = [int][Math]::Min([long]$buf.Length, ($deltaBytes - $w))
+            $fs.Write($buf, 0, $c)
+            $w += $c
+          }
+          $fs.Close()
+          G "write_512mb_cache" ((Get-Date) - $tWrite).TotalSeconds 512
+
+          # 4. Run FULL PRODUCTION SHUTDOWN sequence (apps save WITHOUT APPS_ONLY + c-image save + e-disk save)
+          Write-Host "=== PRODUCTION SHUTDOWN SEQUENCE ==="
+          $tShut = Get-Date
+
+          $tApps = Get-Date
+          Remove-Item Env:APPS_ONLY -ErrorAction SilentlyContinue
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action save *>&1 | Out-Host
-          Write-Host ("GAUGE apps_save seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
-          $i = Get-Item "C:\Program Files\FlexPCProbe" -Force -ErrorAction SilentlyContinue
-          Write-Host ("RESULT junction_type={0}" -f ($(if ($i) { $i.LinkType } else { "gone" })))
-          Write-Host ("RESULT probe_present_after_junction={0}" -f (Test-Path "C:\Program Files\FlexPCProbe\probe.ps1"))
-          $o2 = & powershell -NoProfile -File "C:\Program Files\FlexPCProbe\probe.ps1" 2>&1
-          Write-Host ("RESULT probe_runs_after_junction={0}" -f (($o2 -join "") -like "*FLEXPC_PROBE_OK*"))
+          G "shutdown_apps_save" ((Get-Date) - $tApps).TotalSeconds
 
-          Write-Host "--- e-disk save (flush) ---"
-          $t = Get-Date
+          $jItem = Get-Item $appDir -Force -ErrorAction SilentlyContinue
+          Write-Host ("RESULT app_junction_after_save={0}" -f ($(if ($jItem) { $jItem.LinkType } else { "missing" })))
+          $runOut = (& "$appDir\7z.exe" 2>&1 | Out-String)
+          Write-Host ("RESULT app_runs_via_junction={0}" -f ($runOut -match "7-Zip"))
+
+          $tC = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C" *>&1 | Out-Host
+          G "shutdown_c_save" ((Get-Date) - $tC).TotalSeconds
+          Write-Host ("RESULT c_delta_tar_exists={0}" -f (Test-Path "E:\CloudVM-C\c-delta.tar"))
+
+          $tE = Get-Date
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
-          Write-Host ("GAUGE e_flush seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
-          Write-Host "SAVE_ROUND_DONE"
+          G "shutdown_e_flush" ((Get-Date) - $tE).TotalSeconds 512
+
+          G "shutdown_total" ((Get-Date) - $tShut).TotalSeconds 512
+          Write-Host ("RESULT e_unmounted={0}" -f (-not (Test-Path "E:\")))
+          Write-Host "SAVE_VERIFY_DONE"
           exit 0
 
-      - name: "restore: verify app came back on a fresh machine"
+      - name: "restore: fresh machine boot, mount 25GB E, restore apps + C, verify everything & measure boot time"
         if: inputs.mode == 'restore'
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          Write-Host ("RESULT probe_before_restore={0}" -f (Test-Path "C:\Program Files\FlexPCProbe\probe.ps1"))
+          function G([string]$n, [double]$s, [double]$mb = 0) {
+            $r = if ($s -gt 0 -and $mb -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N2} MBps={2:N1}" -f $n, $s, $r)
+          }
 
-          Write-Host "--- apps restore (rebuild junctions) ---"
-          $t = Get-Date
+          $appDir = "C:\Program Files\FlexPC7Zip"
+          Write-Host ("RESULT pre_boot_app_exists={0}" -f (Test-Path $appDir))
+          Write-Host ("RESULT pre_boot_pd_exists={0}" -f (Test-Path "C:\ProgramData\FlexPC7Zip\config.ini"))
+
+          $tTotalBoot = Get-Date
+
+          $tMount = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+          G "boot_e_mount" ((Get-Date) - $tMount).TotalSeconds
+
+          $tApps = Get-Date
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action restore *>&1 | Out-Host
-          Write-Host ("GAUGE apps_restore seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
+          G "boot_apps_restore" ((Get-Date) - $tApps).TotalSeconds
 
-          $i = Get-Item "C:\Program Files\FlexPCProbe" -Force -ErrorAction SilentlyContinue
-          Write-Host ("RESULT junction_type={0}" -f ($(if ($i) { $i.LinkType } else { "gone" })))
-          Write-Host ("RESULT probe_present_after_boot={0}" -f (Test-Path "C:\Program Files\FlexPCProbe\probe.ps1"))
+          $tC = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore -TargetDir "E:\CloudVM-C" *>&1 | Out-Host
+          G "boot_c_restore" ((Get-Date) - $tC).TotalSeconds
 
-          $t = Get-Date
-          $o = & powershell -NoProfile -File "C:\Program Files\FlexPCProbe\probe.ps1" 2>&1
-          Write-Host ("GAUGE cold_run seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
-          $o | ForEach-Object { Write-Host ("OUT " + [string]$_) }
-          Write-Host ("RESULT probe_runs_after_boot={0}" -f (($o -join "") -like "*FLEXPC_PROBE_OK*"))
-          Write-Host "RESTORE_ROUND_DONE"
+          G "boot_persist_ready_total" ((Get-Date) - $tTotalBoot).TotalSeconds
+
+          # Verify all 5 dimensions on fresh machine
+          $bulk = Get-Item "E:\bulk.bin" -ErrorAction SilentlyContinue
+          $delta = Get-Item "E:\delta512.bin" -ErrorAction SilentlyContinue
+          Write-Host ("RESULT e_bulk_bytes={0}" -f ($(if ($bulk) { $bulk.Length } else { 0 })))
+          Write-Host ("RESULT e_delta512_bytes={0}" -f ($(if ($delta) { $delta.Length } else { 0 })))
+          Write-Host ("RESULT e_delta512_exact={0}" -f ($(if ($delta) { $delta.Length -eq 536870912 } else { $false })))
+
+          $jItem = Get-Item $appDir -Force -ErrorAction SilentlyContinue
+          Write-Host ("RESULT restored_junction_type={0}" -f ($(if ($jItem) { $jItem.LinkType } else { "missing" })))
+          $tExe = Get-Date
+          $exeOut = (& "$appDir\7z.exe" 2>&1 | Out-String)
+          G "cold_launch_restored_exe" ((Get-Date) - $tExe).TotalSeconds
+          Write-Host ("RESULT restored_exe_runs={0}" -f ($exeOut -match "7-Zip"))
+          $marker = Get-Content "$appDir\version-marker.txt" -Raw -ErrorAction SilentlyContinue
+          Write-Host ("RESULT restored_exe_marker={0}" -f ($marker -match "FlexPC-RealExe-20261112"))
+
+          $pdVal = Get-Content "C:\ProgramData\FlexPC7Zip\config.ini" -Raw -ErrorAction SilentlyContinue
+          Write-Host ("RESULT restored_programdata={0}" -f ($pdVal -match "persisted_programdata=true"))
+
+          $deskVal = Get-Content "$env:USERPROFILE\Desktop\flexpc-verify.txt" -Raw -ErrorAction SilentlyContinue
+          Write-Host ("RESULT restored_desktop={0}" -f ($deskVal -match "desktop_alive=true"))
+
+          $regVal = (& reg.exe query "HKCU\Software\Claude" /v "FlexPCVerify" 2>$null | Out-String)
+          Write-Host ("RESULT restored_registry={0}" -f ($regVal -match "reg_alive_2026"))
+
+          $envVal = [System.Environment]::GetEnvironmentVariable("FLEXPC_USER_VAR", "User")
+          Write-Host ("RESULT restored_user_env={0}" -f ($envVal -eq "env_alive_2026"))
+
+          # Clean up delta512.bin so size25 stays clean
+          Remove-Item "E:\delta512.bin" -Force -ErrorAction SilentlyContinue
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
+          Write-Host "RESTORE_VERIFY_DONE"
           exit 0
