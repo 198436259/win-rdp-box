@@ -1,0 +1,90 @@
+name: r2-save-truth
+on: workflow_dispatch
+jobs:
+  save:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_E_PREFIX: size25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "mount via production code, write a session delta, save via production code, verify in r2"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          function G([string]$n, [double]$s, [double]$mb) {
+            $r = if ($s -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
+          }
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+          Write-Host ("GAUGE mount seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          Write-Host ("RESULT mounted={0}" -f (Test-Path "E:\"))
+          if (-not (Test-Path "E:\")) { Write-Host "MOUNT_FAILED"; exit 0 }
+          $top = (Get-ChildItem "E:\" | Select-Object -ExpandProperty Name) -join ","
+          Write-Host ("RESULT e_top={0}" -f $top)
+
+          $deltaMB = [int]$env:DELTA_MB
+          if (-not $deltaMB) { $deltaMB = 300 }
+          Write-Host ("session delta = {0} MB + 1 small text file" -f $deltaMB)
+          $t = Get-Date
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(5).NextBytes($buf)
+          $out = [IO.File]::Open("E:\session-delta.bin", "Create", "Write", "None")
+          $need = [long]$deltaMB * 1MB
+          $w = [long]0
+          while ($w -lt $need) { $c = [int][Math]::Min([long]$buf.Length, ($need - $w)); $out.Write($buf, 0, $c); $w += $c }
+          $out.Close()
+          Set-Content -Path "E:\session-note.txt" -Value "saved this session" -Encoding UTF8
+          G "write_delta" ((Get-Date) - $t).TotalSeconds $deltaMB
+          Write-Host ("RESULT delta_bytes={0}" -f (Get-Item "E:\session-delta.bin").Length)
+
+          Write-Host "=== PRODUCTION SAVE PATH ==="
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
+          $saveSec = ((Get-Date) - $t).TotalSeconds
+          G "e_disk_save_total" $saveSec $deltaMB
+          Write-Host ("RESULT drive_gone={0}" -f (-not (Test-Path "E:\")))
+
+          Write-Host "=== VERIFY IN R2 (clean process, stderr suppressed) ==="
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+          $json = (& $exe lsjson "r2:$($env:R2_BUCKET)/size25" 2>$null | Out-String)
+          $ok = $false
+          try {
+            $items = $json | ConvertFrom-Json
+            foreach ($it in @($items)) {
+              if ($it.Name -eq "session-delta.bin") {
+                Write-Host ("RESULT r2_delta_size={0}" -f $it.Size)
+                $ok = ([long]$it.Size -eq [long]$need)
+              }
+              if ($it.Name -eq "session-note.txt") {
+                Write-Host ("RESULT r2_note_size={0}" -f $it.Size)
+              }
+            }
+            Write-Host ("RESULT r2_names=" + ((@($items) | ForEach-Object { $_.Name }) -join ","))
+          } catch {
+            Write-Host ("RESULT r2_parse_failed raw=" + ($json.Substring(0, [Math]::Min(200, $json.Length))))
+          }
+          Write-Host ("RESULT delta_saved_correctly={0}" -f $ok)
+          Write-Host ("RESULT note_saved={0}" -f ($json -match "session-note"))
+          & $exe delete "r2:$($env:R2_BUCKET)/size25/session-delta.bin" 2>$null | Out-Null
+          & $exe delete "r2:$($env:R2_BUCKET)/size25/session-note.txt" 2>$null | Out-Null
+          Write-Host "SAVE_TRUTH_DONE"
+          exit 0
