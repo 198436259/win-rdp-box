@@ -5,22 +5,23 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Label = "persist"
 $Letter = "E"
+$RcAddr = "127.0.0.1:5572"
 
-function Get-VhdPath {
-  if (Test-Path "D:\") { return "D:\e.vhdx" }
+function Get-WorkRoot {
+  if (Test-Path "D:\") { return "D:\e-disk" }
   $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
   New-Item -ItemType Directory -Force -Path $root | Out-Null
-  Write-Host "e-disk: D: missing, using $root\e.vhdx"
-  return (Join-Path $root "e.vhdx")
+  return (Join-Path $root "e-disk")
 }
 
-$Vhd = Get-VhdPath
+$Work = Get-WorkRoot
+New-Item -ItemType Directory -Force -Path $Work | Out-Null
+$LogPath = Join-Path $Work "mount.log"
+$CacheDir = Join-Path $Work "vfs-cache"
 
 function Get-RcloneExe {
-  $dir = Join-Path $env:RUNNER_TEMP "rclone"
-  if (-not $env:RUNNER_TEMP) { $dir = Join-Path $env:TEMP "rclone" }
+  $dir = Join-Path $Work "rclone"
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe -ErrorAction SilentlyContinue |
     Select-Object -First 1 -ExpandProperty FullName
@@ -29,6 +30,19 @@ function Get-RcloneExe {
   curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
   Expand-Archive $zip $dir -Force
   return (Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName)
+}
+
+function Install-WinFsp {
+  $svc = Get-Service -Name WinFsp -ErrorAction SilentlyContinue
+  if ($svc) {
+    Write-Host "e-disk: WinFsp present"
+    return
+  }
+  $msi = Join-Path $Work "winfsp.msi"
+  Write-Host "e-disk: installing WinFsp"
+  curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+  $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+  if ($p.ExitCode -ne 0) { throw "WinFsp install exit=$($p.ExitCode)" }
 }
 
 function Set-RcloneR2Env {
@@ -45,213 +59,99 @@ function Set-RcloneR2Env {
   $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
 }
 
-function Get-R2Key {
-  if ($env:R2_VHD_KEY) { return $env:R2_VHD_KEY }
-  return "e.vhdx"
+function Get-RemoteRoot {
+  $p = "$($env:R2_E_PREFIX)".Trim("/")
+  if ($p) { return "r2:$($env:R2_BUCKET)/$p" }
+  return "r2:$($env:R2_BUCKET)"
 }
 
-function Get-R2Vhd {
-  return "r2:$($env:R2_BUCKET)/$(Get-R2Key)"
-}
-
-function Test-Sparse([string]$path) {
-  if (-not (Test-Path $path)) { return $false }
-  $out = & fsutil.exe sparse queryflag $path 2>&1 | Out-String
-  Write-Host ("e-disk: sparse query: " + $out.Trim())
-  return ($out -match "is set")
-}
-
-function ConvertTo-Nonsparse([string]$path) {
-  if (-not (Test-Path $path)) { return }
-  if (-not (Test-Sparse $path)) {
-    Write-Host "e-disk: already non-sparse, skip copy"
-    return
-  }
-  $tmp = Join-Path (Split-Path $path) ("nonsparse-" + [IO.Path]::GetFileName($path))
-  Write-Host "e-disk: copying to non-sparse $tmp"
-  $t0 = Get-Date
-  & cmd.exe /c "copy /y `"$path`" `"$tmp`""
-  Write-Host ("e-disk: nonsparse copy seconds={0:N1}" -f ((Get-Date) - $t0).TotalSeconds)
-  if (-not (Test-Path $tmp) -or ((Get-Item $tmp).Length -lt 1MB)) {
-    throw "e-disk: non-sparse copy failed"
-  }
-  Remove-Item $path -Force
-  Move-Item $tmp $path -Force
-  Write-Host "e-disk: non-sparse bytes=$((Get-Item $path).Length)"
-}
-
-function Invoke-Rclone {
-  param([string[]]$RcloneArgs)
+function Invoke-RcloneRc {
+  param([string[]]$RcArgs)
   $exe = Get-RcloneExe
   $old = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
-    $out = & $exe @RcloneArgs 2>&1
-    $code = $LASTEXITCODE
-    $lines = @()
-    foreach ($item in @($out)) {
-      $text = [string]$item
-      if ($text -match "NOTICE: Config file") { continue }
-      if ($item -is [System.Management.Automation.ErrorRecord] -and $text -match "NOTICE:") { continue }
-      $lines += $text
-      if ($item -is [System.Management.Automation.ErrorRecord] -and $text -notmatch "NOTICE:") {
-        Write-Host $text
-      } elseif ($item -isnot [System.Management.Automation.ErrorRecord]) {
-        Write-Host $text
-      }
-    }
-    if ($code -ne 0) { throw "rclone exit=$code args=$($RcloneArgs -join ' ')" }
-    return $lines
+    $out = & $exe rc @RcArgs --rc-addr $RcAddr --json 2>&1
+    return @($out | Where-Object { [string]$_ -notmatch "NOTICE" })
   } finally {
     $ErrorActionPreference = $old
   }
 }
 
-function Wait-PersistVolume([int]$diskNumber) {
-  for ($i = 0; $i -lt 20; $i++) {
-    $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq $Label } | Select-Object -First 1
-    if ($vol) { return $vol }
-    $part = Get-Partition -DiskNumber $diskNumber -ErrorAction SilentlyContinue |
-      Where-Object { $_.Type -eq "Basic" -or $_.Size -gt 8MB } |
-      Select-Object -First 1
-    if ($part) {
-      try { $v = $part | Get-Volume -ErrorAction SilentlyContinue } catch { $v = $null }
-      if ($v) { return $v }
-    }
-    Start-Sleep -Milliseconds 500
-  }
-  return $null
-}
-
-function Set-Letter([object]$vol) {
-  if (-not $vol) { return }
-  $cur = [string]$vol.DriveLetter
-  if ($cur -eq $Letter) { return }
-  if ($cur) {
-    Get-Partition -DriveLetter $cur | Set-Partition -NewDriveLetter $Letter
-    return
-  }
-  $diskNumber = $null
-  try { $diskNumber = (Get-Partition -Volume $vol).DiskNumber } catch {}
-  if ($null -eq $diskNumber) { return }
-  Get-Partition -DiskNumber $diskNumber |
-    Where-Object { $_.Type -eq "Basic" -or $_.Size -gt 8MB } |
-    Select-Object -First 1 |
-    Set-Partition -NewDriveLetter $Letter
-}
-
-function Invoke-DiskpartAttach {
-  $script = @"
-select vdisk file="$Vhd"
-attach vdisk
-"@
-  $tmp = Join-Path $env:TEMP "e-disk-attach.txt"
-  [IO.File]::WriteAllText($tmp, $script)
-  Write-Host "e-disk: diskpart attach"
-  $out = & diskpart.exe /s $tmp 2>&1 | Out-String
-  Write-Host $out
-}
-
-function Mount-Persist {
-  Write-Host "e-disk: volumes before mount"
-  Get-Volume | Format-Table DriveLetter, FileSystemLabel, FileSystem, Size -AutoSize | Out-String | Write-Host
-  $attached = $false
-  try {
-    $img = Mount-DiskImage -ImagePath $Vhd -PassThru -ErrorAction Stop
-    $attached = $true
-    Write-Host "e-disk: Mount-DiskImage ok"
-  } catch {
-    Write-Host "e-disk: Mount-DiskImage failed: $_"
-    try {
-      Import-Module Hyper-V -ErrorAction SilentlyContinue
-      Mount-VHD -Path $Vhd -ErrorAction Stop
-      $attached = $true
-      Write-Host "e-disk: Mount-VHD ok"
-    } catch {
-      Write-Host "e-disk: Mount-VHD failed: $_"
-      Invoke-DiskpartAttach
-      $attached = $true
-    }
-  }
-  Start-Sleep -Seconds 2
-  try { Update-HostStorageCache } catch {}
-  $disk = $null
-  try { $disk = Get-DiskImage -ImagePath $Vhd -ErrorAction Stop | Get-Disk -ErrorAction Stop } catch {}
-  if (-not $disk) {
-    $disk = Get-Disk | Where-Object { $_.Location -like "*e.vhdx*" } | Select-Object -First 1
-  }
-  if ($disk) {
-    Write-Host ("e-disk: disk#={0} style={1} size={2} name={3}" -f $disk.Number, $disk.PartitionStyle, $disk.Size, $disk.FriendlyName)
-    $raw = [string]$disk.PartitionStyle
-    if ($raw -eq "RAW") {
-      Write-Host "e-disk: RAW disk, initializing (new empty VHD only)"
-      Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru |
-        New-Partition -UseMaximumSize -DriveLetter $Letter |
-        Format-Volume -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false | Out-Null
-      return
-    }
-    $vol = Wait-PersistVolume $disk.Number
-    if ($vol) {
-      Set-Letter $vol
-      return
-    }
-    $part = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
-      Where-Object { $_.Type -eq "Basic" -or $_.Size -gt 8MB } |
-      Select-Object -First 1
-    if ($part) {
-      Write-Host ("e-disk: partition type={0} letter={1} size={2}" -f $part.Type, $part.DriveLetter, $part.Size)
-      if (-not $part.DriveLetter) {
-        $part | Set-Partition -NewDriveLetter $Letter
-      } elseif ($part.DriveLetter -ne $Letter) {
-        Set-Partition -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber -NewDriveLetter $Letter
-      }
-      return
-    }
-  }
-  Write-Host "e-disk: volumes after mount"
-  Get-Volume | Format-Table DriveLetter, FileSystemLabel, FileSystem, Size -AutoSize | Out-String | Write-Host
-  Get-Partition | Format-Table DiskNumber, DriveLetter, Size, Type -AutoSize | Out-String | Write-Host
-  throw ("e-disk: mounted={0} but E: not assigned" -f $attached)
-}
-
 function Invoke-Mount {
   Set-RcloneR2Env
-  $remote = Get-R2Vhd
-  if (Test-Path $Vhd) { Remove-Item $Vhd -Force }
-  Write-Host "e-disk: trying download e.vhdx"
-  $got = $false
-  try {
-    # 16 parallel streams: measured 25GB download 546s -> 295s (49.5 -> 87.5 MB/s).
-    Invoke-Rclone @("copy", $remote, (Split-Path $Vhd), "--progress", "--local-no-sparse", "--multi-thread-streams", "16") | Out-Null
-    if ((Test-Path $Vhd) -and ((Get-Item $Vhd).Length -gt 1MB)) { $got = $true }
-  } catch {
-    Write-Host "e-disk: download failed: $_"
+  Install-WinFsp
+  $exe = Get-RcloneExe
+
+  if (Test-Path "${Letter}:\") {
+    Write-Host "e-disk: ${Letter}: already mapped"
+    return
   }
-  if ($got) {
-    Write-Host "e-disk: downloaded bytes=$((Get-Item $Vhd).Length)"
-    ConvertTo-Nonsparse $Vhd
-  } else {
-    Write-Host "e-disk: no remote e.vhdx, creating 100GB dynamic VHD (not uploaded)"
-    if (Test-Path $Vhd) { Remove-Item $Vhd -Force }
-    New-VHD -Path $Vhd -SizeBytes 100GB -Dynamic | Out-Null
+
+  New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+  if (Test-Path $LogPath) { Remove-Item $LogPath -Force -ErrorAction SilentlyContinue }
+
+  # 0777 for files and dirs: without the execute bit Windows refuses to launch
+  # .exe/.dll served by the mount ("Access is denied").
+  $args = @(
+    "mount", (Get-RemoteRoot), "${Letter}:",
+    "--vfs-cache-mode", "full",
+    "--cache-dir", $CacheDir,
+    "--vfs-cache-max-size", "20G",
+    "--links",
+    "--dir-cache-time", "10s",
+    "--transfers", "16",
+    "--file-perms", "0777",
+    "--dir-perms", "0777",
+    "--rc", "--rc-addr", $RcAddr,
+    "--log-file", $LogPath,
+    "--log-level", "INFO"
+  )
+  $t0 = Get-Date
+  $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList $args
+  $up = $false
+  for ($i = 0; $i -lt 240; $i++) {
+    Start-Sleep -Milliseconds 250
+    if (Test-Path "${Letter}:\") { $up = $true; break }
+    if ($proc.HasExited) { break }
   }
-  Mount-Persist
-  Start-Sleep -Seconds 1
-  if (-not (Test-Path "E:\")) { throw "E: not mounted" }
-  Write-Host "e-disk: mounted E: label=$Label"
+  $sec = ((Get-Date) - $t0).TotalSeconds
+  Write-Host ("e-disk: ${Letter}: visible={0} seconds={1:N2}" -f $up, $sec)
+  if (-not $up) {
+    if (Test-Path $LogPath) { Get-Content $LogPath -Tail 40 -ErrorAction SilentlyContinue | Out-Host }
+    throw "e-disk: ${Letter}: did not mount"
+  }
 }
 
 function Invoke-Save {
   Set-RcloneR2Env
-  if (Get-DiskImage -ImagePath $Vhd -ErrorAction SilentlyContinue | Where-Object { $_.Attached }) {
-    Dismount-DiskImage -ImagePath $Vhd | Out-Null
+  if (-not (Test-Path "${Letter}:\")) {
+    Write-Host "e-disk: ${Letter}: not mounted, nothing to flush"
+    return
   }
-  if (-not (Test-Path $Vhd)) { throw "D:\e.vhdx missing, skip upload not allowed" }
-  Write-Host "e-disk: uploading bytes=$((Get-Item $Vhd).Length)"
-  # 64MiB chunks: fewer Class A ops per save (R2 bills $4.50/million writes).
-  Invoke-Rclone @("copyto", $Vhd, (Get-R2Vhd), "--progress", "--s3-chunk-size", "64M") | Out-Null
-  Invoke-Rclone @("ls", (Get-R2Vhd)) | Out-Null
-  Write-Host "e-disk: uploaded e.vhdx"
+
+  Write-Host "e-disk: flushing pending writes"
+  Invoke-RcloneRc @("vfs/forget") | Out-Null
+
+  $t0 = Get-Date
+  Invoke-RcloneRc @("mount/unmount", "mountPoint=${Letter}:") | Out-Null
+  $gone = $false
+  for ($i = 0; $i -lt 240; $i++) {
+    Start-Sleep -Milliseconds 250
+    if (-not (Test-Path "${Letter}:\")) { $gone = $true; break }
+  }
+  if (-not $gone) {
+    Write-Host "e-disk: graceful unmount timed out, stopping process"
+    Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 5
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & cmd.exe /c "rmdir ${Letter}:" 2>&1 | Out-Null
+    $ErrorActionPreference = $old
+    $gone = -not (Test-Path "${Letter}:\")
+  }
+  Write-Host ("e-disk: unmounted={0} seconds={1:N2}" -f $gone, ((Get-Date) - $t0).TotalSeconds)
+  if (-not $gone) { throw "e-disk: ${Letter}: still mounted after flush" }
 }
 
 if ($Action -eq "mount") { Invoke-Mount } else { Invoke-Save }
