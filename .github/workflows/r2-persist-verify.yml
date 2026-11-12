@@ -47,6 +47,7 @@ jobs:
 
           Write-Host "--- apps save (upload + junction) ---"
           $t = Get-Date
+          $env:APPS_ONLY = "FlexPCProbe"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action save *>&1 | Out-Host
           Write-Host ("GAUGE apps_save seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
           $i = Get-Item "C:\Program Files\FlexPCProbe" -Force -ErrorAction SilentlyContinue
