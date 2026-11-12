@@ -1,81 +1,94 @@
 name: r2-persist-verify
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "save = full production save on 25GB E:; restore = fresh machine restore & verify"
-        required: true
-        default: save
-        type: choice
-        options: [save, restore]
 jobs:
-  verify:
+  save_session:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-      R2_E_PREFIX: size25
+      R2_E_PREFIX: b2-verify
     steps:
       - uses: actions/checkout@v4
 
-      - name: "save: mount 25GB E, install real exe+ProgramData+C-state, production save (NO APPS_ONLY)"
-        if: inputs.mode == 'save'
+      - name: "Machine 1: Build base.vhdx.zst -> Reboot into diff.vhdx -> Install App + C-state + 512MB -> Incremental Save"
         shell: powershell
         run: |
-          $ErrorActionPreference = "Continue"
+          $ErrorActionPreference = "Stop"
           function G([string]$n, [double]$s, [double]$mb = 0) {
             $r = if ($s -gt 0 -and $mb -gt 0) { $mb / $s } else { 0 }
             Write-Host ("GAUGE {0} seconds={1:N2} MBps={2:N1}" -f $n, $s, $r)
           }
 
-          $tBoot = Get-Date
+          # Step 1: Initial boot on empty prefix -> creates fresh 100GB dynamic base.vhdx, writes 1GB baseline data, saves base.vhdx.zst
+          Write-Host "=== STEP 1: INITIALIZE BASE.VHDX.ZST ==="
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
-          G "e_mount" ((Get-Date) - $tBoot).TotalSeconds
-          Write-Host ("RESULT e_present={0}" -f (Test-Path "E:\"))
-          if (-not (Test-Path "E:\")) { throw "E: not mounted" }
+          if (-not (Test-Path "E:\")) { throw "E: not mounted on init" }
 
-          $bulk = Get-Item "E:\bulk.bin" -ErrorAction SilentlyContinue
-          $bulkGB = if ($bulk) { [Math]::Round($bulk.Length / 1GB, 2) } else { 0 }
-          Write-Host ("RESULT bulk_gb={0}" -f $bulkGB)
+          $buf = New-Object byte[] (8MB)
+          $rnd = [Random]::new(2026)
+          $rndPart = New-Object byte[] (3355443)
+          $hdr = New-Object byte[] 64
+          $rnd.NextBytes($rndPart)
+          [Array]::Copy($rndPart, 0, $buf, 0, $rndPart.Length)
+          for ($k = $rndPart.Length; $k -lt $buf.Length; $k++) {
+            $buf[$k] = [byte](($k * 31 + ($k -shr 8)) -band 0xFF)
+          }
 
-          # Check if E: is in Global DOS Devices (\GLOBAL??) via SYSTEM task
-          $rcloneTask = Get-ScheduledTask -TaskName "FlexPCRcloneMountE" -ErrorAction SilentlyContinue
-          Write-Host ("RESULT mount_task_state={0}" -f ($(if ($rcloneTask) { $rcloneTask.State } else { "none" })))
+          $bf = [IO.File]::Open("E:\base-1gb.dat", "Create", "Write", "None")
+          $bw = [long]0
+          while ($bw -lt 1GB) {
+            $rnd.NextBytes($hdr)
+            [Array]::Copy($hdr, 0, $buf, 0, 64)
+            $bf.Write($buf, 0, $buf.Length)
+            $bw += $buf.Length
+          }
+          $bf.Close()
+          Set-Content -Path "E:\base-marker.txt" -Value "base_ok_2026" -Encoding UTF8
 
-          # 1. Install a real multi-file native binary (7z.exe + 7z.dll) into a new Program Files folder
+          $tBaseSave = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
+          G "init_base_save" ((Get-Date) - $tBaseSave).TotalSeconds 1024
+
+          # Step 2: Simulate normal session boot (mounts base.vhdx.zst + creates diff.vhdx)
+          Write-Host "=== STEP 2: SESSION BOOT & USER MODIFICATIONS ==="
+          Remove-Item "D:\e-disk\*.vhdx", "D:\e-disk\*.zst" -Force -ErrorAction SilentlyContinue
+          $tMount = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+          G "session_e_mount" ((Get-Date) - $tMount).TotalSeconds
+
+          # 2a. Install a real multi-file native binary (7z.exe + 7z.dll) into C:\Program Files\FlexPC7Zip
           $appDir = "C:\Program Files\FlexPC7Zip"
           New-Item -ItemType Directory -Force -Path $appDir | Out-Null
           Copy-Item "C:\Program Files\7-Zip\7z.exe" "$appDir\7z.exe" -Force
           Copy-Item "C:\Program Files\7-Zip\7z.dll" "$appDir\7z.dll" -Force
-          Set-Content -Path "$appDir\version-marker.txt" -Value "FlexPC-RealExe-20261112" -Encoding UTF8
+          Set-Content -Path "$appDir\version-marker.txt" -Value "FlexPC-B2-RealExe-20261112" -Encoding UTF8
 
-          # 2. Create ProgramData, Desktop file, Registry key, and User env var
+          # 2b. Create ProgramData, Desktop file, Registry key, and User env var
           New-Item -ItemType Directory -Force -Path "C:\ProgramData\FlexPC7Zip" | Out-Null
           Set-Content -Path "C:\ProgramData\FlexPC7Zip\config.ini" -Value "persisted_programdata=true" -Encoding UTF8
           Set-Content -Path "$env:USERPROFILE\Desktop\flexpc-verify.txt" -Value "desktop_alive=true" -Encoding UTF8
           & reg.exe add "HKCU\Software\Claude" /v "FlexPCVerify" /t REG_SZ /d "reg_alive_2026" /f | Out-Null
           [System.Environment]::SetEnvironmentVariable("FLEXPC_USER_VAR", "env_alive_2026", "User")
 
-          # 3. Write 512MB new data onto E: to measure 64MiB chunk upload speed during shutdown
+          # 2c. Write 512MB new data onto E:
           $tWrite = Get-Date
-          $deltaBytes = [long](512MB)
-          $buf = New-Object byte[] (8MB)
-          [Random]::new(42).NextBytes($buf)
-          $fs = [IO.File]::Open("E:\delta512.bin", "Create", "Write", "None")
-          $w = [long]0
-          while ($w -lt $deltaBytes) {
-            $c = [int][Math]::Min([long]$buf.Length, ($deltaBytes - $w))
-            $fs.Write($buf, 0, $c)
-            $w += $c
+          $df = [IO.File]::Open("E:\delta512.bin", "Create", "Write", "None")
+          $dw = [long]0
+          while ($dw -lt 512MB) {
+            $rnd.NextBytes($hdr)
+            [Array]::Copy($hdr, 0, $buf, 0, 64)
+            $df.Write($buf, 0, $buf.Length)
+            $dw += $buf.Length
           }
-          $fs.Close()
-          G "write_512mb_cache" ((Get-Date) - $tWrite).TotalSeconds 512
+          $df.Close()
+          G "write_512mb_local_vhdx" ((Get-Date) - $tWrite).TotalSeconds 512
 
-          # 4. Run FULL PRODUCTION SHUTDOWN sequence (apps save WITHOUT APPS_ONLY + c-image save + e-disk save)
-          Write-Host "=== PRODUCTION SHUTDOWN SEQUENCE ==="
+          # Step 3: Run FULL PRODUCTION SHUTDOWN sequence (apps.ps1 save + c-image.ps1 save + e-disk.ps1 save -> diff.vhdx.zst)
+          Write-Host "=== STEP 3: PRODUCTION INCREMENTAL SHUTDOWN SAVE ==="
           $tShut = Get-Date
 
           $tApps = Get-Date
@@ -95,18 +108,29 @@ jobs:
 
           $tE = Get-Date
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
-          G "shutdown_e_flush" ((Get-Date) - $tE).TotalSeconds 512
+          G "shutdown_e_diff_save" ((Get-Date) - $tE).TotalSeconds 512
 
           G "shutdown_total" ((Get-Date) - $tShut).TotalSeconds 512
           Write-Host ("RESULT e_unmounted={0}" -f (-not (Test-Path "E:\")))
-          Write-Host "SAVE_VERIFY_DONE"
-          exit 0
+          Write-Host "MACHINE_1_SAVE_DONE"
 
-      - name: "restore: fresh machine boot, mount 25GB E, restore apps + C, verify everything & measure boot time"
-        if: inputs.mode == 'restore'
+  restore_on_fresh_machine:
+    needs: save_session
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_E_PREFIX: b2-verify
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Machine 2 (Fresh Runner): Restore base.vhdx.zst + diff.vhdx.zst + apps + C-state & verify all 7 dimensions"
         shell: powershell
         run: |
-          $ErrorActionPreference = "Continue"
+          $ErrorActionPreference = "Stop"
           function G([string]$n, [double]$s, [double]$mb = 0) {
             $r = if ($s -gt 0 -and $mb -gt 0) { $mb / $s } else { 0 }
             Write-Host ("GAUGE {0} seconds={1:N2} MBps={2:N1}" -f $n, $s, $r)
@@ -132,12 +156,11 @@ jobs:
 
           G "boot_persist_ready_total" ((Get-Date) - $tTotalBoot).TotalSeconds
 
-          # Verify all 5 dimensions on fresh machine
-          $bulk = Get-Item "E:\bulk.bin" -ErrorAction SilentlyContinue
-          $delta = Get-Item "E:\delta512.bin" -ErrorAction SilentlyContinue
-          Write-Host ("RESULT e_bulk_bytes={0}" -f ($(if ($bulk) { $bulk.Length } else { 0 })))
-          Write-Host ("RESULT e_delta512_bytes={0}" -f ($(if ($delta) { $delta.Length } else { 0 })))
-          Write-Host ("RESULT e_delta512_exact={0}" -f ($(if ($delta) { $delta.Length -eq 536870912 } else { $false })))
+          # Verify all 7 dimensions on the fresh machine
+          $baseFile = Get-Item "E:\base-1gb.dat" -ErrorAction SilentlyContinue
+          $deltaFile = Get-Item "E:\delta512.bin" -ErrorAction SilentlyContinue
+          Write-Host ("RESULT e_base1gb_exact={0}" -f ($(if ($baseFile) { $baseFile.Length -eq 1GB } else { $false })))
+          Write-Host ("RESULT e_delta512_exact={0}" -f ($(if ($deltaFile) { $deltaFile.Length -eq 512MB } else { $false })))
 
           $jItem = Get-Item $appDir -Force -ErrorAction SilentlyContinue
           Write-Host ("RESULT restored_junction_type={0}" -f ($(if ($jItem) { $jItem.LinkType } else { "missing" })))
@@ -146,7 +169,7 @@ jobs:
           G "cold_launch_restored_exe" ((Get-Date) - $tExe).TotalSeconds
           Write-Host ("RESULT restored_exe_runs={0}" -f ($exeOut -match "7-Zip"))
           $marker = Get-Content "$appDir\version-marker.txt" -Raw -ErrorAction SilentlyContinue
-          Write-Host ("RESULT restored_exe_marker={0}" -f ($marker -match "FlexPC-RealExe-20261112"))
+          Write-Host ("RESULT restored_exe_marker={0}" -f ($marker -match "FlexPC-B2-RealExe-20261112"))
 
           $pdVal = Get-Content "C:\ProgramData\FlexPC7Zip\config.ini" -Raw -ErrorAction SilentlyContinue
           Write-Host ("RESULT restored_programdata={0}" -f ($pdVal -match "persisted_programdata=true"))
@@ -160,8 +183,22 @@ jobs:
           $envVal = [System.Environment]::GetEnvironmentVariable("FLEXPC_USER_VAR", "User")
           Write-Host ("RESULT restored_user_env={0}" -f ($envVal -eq "env_alive_2026"))
 
-          # Clean up delta512.bin so size25 stays clean
-          Remove-Item "E:\delta512.bin" -Force -ErrorAction SilentlyContinue
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
-          Write-Host "RESTORE_VERIFY_DONE"
+          Dismount-DiskImage -ImagePath "D:\e-disk\diff.vhdx" -ErrorAction SilentlyContinue | Out-Null
+          $rclone = (Get-ChildItem "D:\e-disk\rclone" -Recurse -Filter rclone.exe | Select-Object -First 1).FullName
+          $ErrorActionPreference = "Continue"
+          & $rclone purge "r2:$($env:R2_BUCKET)/b2-verify" 2>&1 | Out-Null
+
+          # Also pre-build base.vhdx.zst at bucket root from user's real e.vhdx so next win-rdp boot uses B2 immediately
+          Remove-Item Env:R2_E_PREFIX -ErrorAction SilentlyContinue
+          Remove-Item "D:\e-disk\*.vhdx", "D:\e-disk\*.zst", "D:\e-disk\*.flag" -Force -ErrorAction SilentlyContinue
+          $rootFiles = @(& $rclone lsf "r2:$($env:R2_BUCKET)" --max-depth 1 2>&1)
+          if (($rootFiles -contains "e.vhdx") -and (-not ($rootFiles -contains "base.vhdx.zst"))) {
+            Write-Host "=== PRE-MIGRATING ROOT e.vhdx TO base.vhdx.zst FOR PRODUCTION ==="
+            $tMig = Get-Date
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+            powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
+            G "prod_root_evhdx_to_base_zst_migration" ((Get-Date) - $tMig).TotalSeconds
+          }
+
+          Write-Host "MACHINE_2_RESTORE_VERIFY_DONE"
           exit 0
