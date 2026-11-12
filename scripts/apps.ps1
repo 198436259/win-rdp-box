@@ -25,48 +25,6 @@ $Roots = @(
   @{ Path = "C:\Program Files (x86)"; Remote = "ProgramFilesX86" }
 )
 
-function Get-RcloneExe {
-  $dir = if (Test-Path "D:\") { "D:\e-disk\rclone" } else { Join-Path $env:TEMP "e-disk\rclone" }
-  New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe -ErrorAction SilentlyContinue |
-    Select-Object -First 1 -ExpandProperty FullName
-  if ($exe) { return $exe }
-  $zip = Join-Path $dir "rclone.zip"
-  curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
-  Expand-Archive $zip $dir -Force
-  return (Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName)
-}
-
-function Get-RemoteRoot {
-  $p = "$($env:R2_E_PREFIX)".Trim("/")
-  if ($p) { return "r2:$($env:R2_BUCKET)/$p" }
-  return "r2:$($env:R2_BUCKET)"
-}
-
-function Set-RcloneR2Env {
-  if (-not $env:R2_BUCKET) { throw "R2_BUCKET missing" }
-  $env:RCLONE_CONFIG_R2_TYPE = "s3"
-  $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
-  $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
-  $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
-  $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
-  $env:RCLONE_CONFIG_R2_REGION = "auto"
-  $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
-}
-
-function Invoke-Rclone {
-  param([string[]]$RcloneArgs)
-  $exe = Get-RcloneExe
-  $old = $ErrorActionPreference
-  $ErrorActionPreference = "Continue"
-  try {
-    $out = & $exe @RcloneArgs 2>&1
-    return @($out | Where-Object { [string]$_ -notmatch "NOTICE" })
-  } finally {
-    $ErrorActionPreference = $old
-  }
-}
-
 function Get-ManifestPath {
   return (Join-Path "${Letter}:\" $ManifestRel)
 }
@@ -131,7 +89,7 @@ function Test-IsJunction([string]$path) {
 }
 
 function Get-WorkRoot {
-  if (Test-Path "D:\") { return "D:\e-disk" }
+  if ((Test-Path "D:\") -and ((Get-PSDrive D).Free -gt 20GB)) { return "D:\e-disk" }
   $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
   return (Join-Path $root "e-disk")
 }
@@ -172,7 +130,6 @@ function Ensure-BootBaseline {
 }
 
 function Invoke-Save {
-  Set-RcloneR2Env
   if (-not (Test-Path "${Letter}:\")) { throw "apps: ${Letter}: not mounted" }
 
   $baseline = Ensure-BootBaseline
@@ -195,36 +152,30 @@ function Invoke-Save {
         }
       }
 
-      $remote = (Get-RemoteRoot) + "/$($root.Remote)/$($c.Name)"
-      $t0 = Get-Date
-      $out = Invoke-Rclone @("copy", $c.FullName, $remote, "--transfers", "16", "--checkers", "32", "--s3-chunk-size", "64M")
-      $code = $LASTEXITCODE
-      $sec = ((Get-Date) - $t0).TotalSeconds
-      if ($code -ne 0) {
-        Write-Host ("apps: upload failed name={0} exit={1}" -f $c.Name, $code)
-        continue
-      }
-
       $localFiles = @(Get-ChildItem $c.FullName -Recurse -File -ErrorAction SilentlyContinue)
       $localBytes = [long]0
       foreach ($f in $localFiles) { $localBytes += $f.Length }
-      $remoteCount = @(Invoke-Rclone @("lsf", $remote, "--recursive") | Where-Object { $_ -notmatch "NOTICE" }).Count
-      Write-Host ("apps: uploaded name={0} files={1} bytes={2} remote={3} seconds={4:N1}" -f $c.Name, $localFiles.Count, $localBytes, $remoteCount, $sec)
-      if ($remoteCount -lt $localFiles.Count) {
-        Write-Host ("apps: remote count short for {0}, keeping local copy" -f $c.Name)
+
+      # Copy directly into E:\ProgramFiles\<App> on local VHDX (zero extra R2 Class A requests;
+      # persisted and zstd-compressed automatically inside diff.vhdx.zst / base.vhdx.zst).
+      $target = Join-Path ("${Letter}:\" + $root.Remote) $c.Name
+      New-Item -ItemType Directory -Force -Path $target | Out-Null
+      $t0 = Get-Date
+      $old = $ErrorActionPreference
+      $ErrorActionPreference = "Continue"
+      & robocopy $c.FullName $target /MIR /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+      $rc = $LASTEXITCODE
+      $ErrorActionPreference = $old
+      $sec = ((Get-Date) - $t0).TotalSeconds
+      if ($rc -ge 8) {
+        Write-Host ("apps: robocopy failed name={0} exit={1}" -f $c.Name, $rc)
         continue
       }
 
-      # Refresh rclone mount dir cache so the newly uploaded remote folder is immediately visible on E:
-      Invoke-Rclone @("rc", "vfs/forget", "--rc-addr", "127.0.0.1:5572") | Out-Null
-
-      $target = Join-Path ("${Letter}:\" + $root.Remote) $c.Name
-      for ($w = 0; $w -lt 20; $w++) {
-        if (Test-Path $target) { break }
-        Start-Sleep -Milliseconds 250
-      }
-      if (-not (Test-Path $target)) {
-        Write-Host ("apps: remote target not visible {0}" -f $target)
+      $dstFiles = @(Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue)
+      Write-Host ("apps: staged to E: name={0} files={1} bytes={2} dstFiles={3} seconds={4:N2}" -f $c.Name, $localFiles.Count, $localBytes, $dstFiles.Count, $sec)
+      if ($dstFiles.Count -lt $localFiles.Count) {
+        Write-Host ("apps: target count short for {0}, keeping local copy" -f $c.Name)
         continue
       }
 
@@ -247,7 +198,6 @@ function Invoke-Save {
 }
 
 function Invoke-Link {
-  Set-RcloneR2Env
   if (-not (Test-Path "${Letter}:\")) { throw "apps: ${Letter}: not mounted" }
   $name = $env:APPS_ONLY
   if (-not $name) { throw "apps: APPS_ONLY missing" }
@@ -266,7 +216,6 @@ function Invoke-Link {
 
 function Invoke-Restore {
   Ensure-BootBaseline | Out-Null
-  Set-RcloneR2Env
   if (-not (Test-Path "${Letter}:\")) { throw "apps: ${Letter}: not mounted" }
 
   $entries = @(Read-Manifest)
