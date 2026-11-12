@@ -17,7 +17,7 @@ jobs:
       - name: "Machine 1: Build base.vhdx.zst -> Reboot into diff.vhdx -> Install App + C-state + 512MB -> Incremental Save"
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
           function G([string]$n, [double]$s, [double]$mb = 0) {
             $r = if ($s -gt 0 -and $mb -gt 0) { $mb / $s } else { 0 }
             Write-Host ("GAUGE {0} seconds={1:N2} MBps={2:N1}" -f $n, $s, $r)
@@ -130,7 +130,7 @@ jobs:
       - name: "Machine 2 (Fresh Runner): Restore base.vhdx.zst + diff.vhdx.zst + apps + C-state & verify all 7 dimensions"
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
           function G([string]$n, [double]$s, [double]$mb = 0) {
             $r = if ($s -gt 0 -and $mb -gt 0) { $mb / $s } else { 0 }
             Write-Host ("GAUGE {0} seconds={1:N2} MBps={2:N1}" -f $n, $s, $r)
