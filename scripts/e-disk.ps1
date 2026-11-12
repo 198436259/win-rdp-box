@@ -20,6 +20,7 @@ $BaseVhd = Join-Path $Work "base.vhdx"
 $BaseZst = Join-Path $Work "base.vhdx.zst"
 $DiffVhd = Join-Path $Work "diff.vhdx"
 $DiffZst = Join-Path $Work "diff.vhdx.zst"
+$ConfPath = Join-Path $Work "rclone.conf"
 $NeedBaseFlag = Join-Path $Work "need-base-upload.flag"
 $BaselinePath = Join-Path $Work "boot-baseline.json"
 
@@ -89,6 +90,24 @@ function Set-RcloneR2Env {
   $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
   $env:RCLONE_CONFIG_R2_REGION = "auto"
   $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+  if (-not (Test-Path $ConfPath)) {
+    [IO.File]::WriteAllText($ConfPath, "[r2]`r`ntype = s3`r`nprovider = Cloudflare`r`nregion = auto`r`nno_check_bucket = true`r`n", (New-Object System.Text.UTF8Encoding($false)))
+  }
+  $env:RCLONE_CONFIG = $ConfPath
+}
+
+function Invoke-Rclone([string[]]$RcloneArgs) {
+  $rclone = Get-RcloneExe
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $out = & $rclone @RcloneArgs 2>&1
+    $code = $LASTEXITCODE
+    $out | Where-Object { [string]$_ -notmatch "NOTICE:" } | ForEach-Object { Write-Host $_ }
+    if ($code -ne 0) { throw "rclone failed exit=$code args=$($RcloneArgs -join ' ')" }
+  } finally {
+    $ErrorActionPreference = $old
+  }
 }
 
 function Get-RemoteRoot {
@@ -164,8 +183,8 @@ function Invoke-Mount {
   if ($files -contains "base.vhdx.zst") {
     # Standard B2 path: download base.vhdx.zst (+ optional diff.vhdx.zst), decompress on local NVMe, attach diff.vhdx
     $tDown = Get-Date
-    & $rclone copy "$remote/base.vhdx.zst" $Work --local-no-sparse --multi-thread-streams 16 --stats 0
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $BaseZst)) { throw "e-disk: download base.vhdx.zst failed" }
+    Invoke-Rclone @("copy", "$remote/base.vhdx.zst", $Work, "--local-no-sparse", "--multi-thread-streams", "16", "--stats", "0")
+    if (-not (Test-Path $BaseZst)) { throw "e-disk: download base.vhdx.zst failed" }
     $zstMB = (Get-Item $BaseZst).Length / 1MB
     $downSec = ((Get-Date) - $tDown).TotalSeconds
     Write-Host ("e-disk: downloaded base.vhdx.zst size={0:N1}MB seconds={1:N2} MBps={2:N1}" -f $zstMB, $downSec, ($zstMB / [Math]::Max($downSec, 0.01)))
@@ -180,8 +199,8 @@ function Invoke-Mount {
 
     if ($files -contains "diff.vhdx.zst") {
       $tDiff = Get-Date
-      & $rclone copy "$remote/diff.vhdx.zst" $Work --local-no-sparse --multi-thread-streams 16 --stats 0
-      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $DiffZst)) { throw "e-disk: download diff.vhdx.zst failed" }
+      Invoke-Rclone @("copy", "$remote/diff.vhdx.zst", $Work, "--local-no-sparse", "--multi-thread-streams", "16", "--stats", "0")
+      if (-not (Test-Path $DiffZst)) { throw "e-disk: download diff.vhdx.zst failed" }
       $diffZstMB = (Get-Item $DiffZst).Length / 1MB
       & $zstd -q -d -T0 -f $DiffZst -o $DiffVhd
       if ($LASTEXITCODE -ne 0 -or -not (Test-Path $DiffVhd)) { throw "e-disk: decompress diff.vhdx.zst failed" }
@@ -199,8 +218,8 @@ function Invoke-Mount {
     Write-Host "e-disk: migrating legacy e.vhdx from R2 to base.vhdx.zst architecture"
     $tDown = Get-Date
     $legacyPath = Join-Path $Work "e.vhdx"
-    & $rclone copy "$remote/e.vhdx" $Work --local-no-sparse --multi-thread-streams 16 --stats 0
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $legacyPath)) { throw "e-disk: download legacy e.vhdx failed" }
+    Invoke-Rclone @("copy", "$remote/e.vhdx", $Work, "--local-no-sparse", "--multi-thread-streams", "16", "--stats", "0")
+    if (-not (Test-Path $legacyPath)) { throw "e-disk: download legacy e.vhdx failed" }
     Move-Item $legacyPath $BaseVhd -Force
     & fsutil sparse setflag $BaseVhd 0 2>$null | Out-Null
     $rawMB = (Get-Item $BaseVhd).Length / 1MB
@@ -284,8 +303,7 @@ function Invoke-Save {
     Write-Host ("e-disk: compressed base.vhdx raw={0:N1}MB -> zst={1:N1}MB ({2:P1}) in {3:N2}s ({4:N1} MB/s)" -f $rawMB, $zstMB, ($zstBytes / [double][Math]::Max($rawBytes, 1)), $compSec, ($rawMB / [Math]::Max($compSec, 0.01)))
 
     $tUp = Get-Date
-    & $rclone copyto $BaseZst "$remote/base.vhdx.zst" --s3-chunk-size 64M --s3-upload-concurrency 16 --stats 0
-    if ($LASTEXITCODE -ne 0) { throw "e-disk: rclone upload base.vhdx.zst failed" }
+    Invoke-Rclone @("copyto", $BaseZst, "$remote/base.vhdx.zst", "--s3-chunk-size", "64M", "--s3-upload-concurrency", "16", "--stats", "0")
     $upSec = ((Get-Date) - $tUp).TotalSeconds
     Remove-Item $BaseZst -Force -ErrorAction SilentlyContinue
     if (Test-Path $NeedBaseFlag) { Remove-Item $NeedBaseFlag -Force -ErrorAction SilentlyContinue }
@@ -307,8 +325,7 @@ function Invoke-Save {
     Write-Host ("e-disk: compressed diff.vhdx raw={0:N1}MB -> zst={1:N1}MB ({2:P1}) in {3:N2}s ({4:N1} MB/s)" -f $rawMB, $zstMB, ($zstBytes / [double][Math]::Max($diffBytes, 1)), $compSec, ($rawMB / [Math]::Max($compSec, 0.01)))
 
     $tUp = Get-Date
-    & $rclone copyto $DiffZst "$remote/diff.vhdx.zst" --s3-chunk-size 64M --s3-upload-concurrency 16 --stats 0
-    if ($LASTEXITCODE -ne 0) { throw "e-disk: rclone upload diff.vhdx.zst failed" }
+    Invoke-Rclone @("copyto", $DiffZst, "$remote/diff.vhdx.zst", "--s3-chunk-size", "64M", "--s3-upload-concurrency", "16", "--stats", "0")
     $upSec = ((Get-Date) - $tUp).TotalSeconds
     Remove-Item $DiffZst -Force -ErrorAction SilentlyContinue
     Write-Host ("e-disk: uploaded diff.vhdx.zst ({0:N1}MB) in {1:N2}s ({2:N1} MB/s), total_save={3:N2}s" -f $zstMB, $upSec, ($zstMB / [Math]::Max($upSec, 0.01)), ((Get-Date) - $tSave).TotalSeconds)
