@@ -1,0 +1,213 @@
+name: r2-size25-see
+on: workflow_dispatch
+jobs:
+  see:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      RDP_PASS: ${{ secrets.RDP_PASS }}
+      SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+      SNAPSHOT_TOKEN: ${{ secrets.SNAPSHOT_TOKEN }}
+    steps:
+      - name: enable rdp
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $pw = $env:RDP_PASS
+          if (-not $pw) { $pw = "Runner123" }
+          net user runneradmin $pw 2>&1 | Out-Host
+          net localgroup administrators runneradmin /add 2>&1 | Out-Host
+          net localgroup "Remote Desktop Users" runneradmin /add 2>&1 | Out-Host
+          $ErrorActionPreference = "Stop"
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fSingleSessionPerUser" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service TermService -Force
+          Start-Sleep -Seconds 3
+          Write-Host "rdp enabled"
+
+      - name: start ngrok and publish
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = Join-Path $env:RUNNER_TEMP "ngrok"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "ngrok.zip"
+          curl.exe -fsSL -o $zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $ngrok = Join-Path $dir "ngrok.exe"
+          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+          Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
+          $url = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $log) {
+              $m = Select-String -Path $log -Pattern "url=(tcp://[^ ]+)" | Select-Object -Last 1
+              if ($m) { $url = $m.Matches[0].Groups[1].Value; break }
+            }
+          }
+          if (-not $url) { throw "ngrok url not found" }
+          $port = ($url -split ":")[-1]
+          $hostName = ($url -replace "^tcp://","" -split ":")[0]
+          Write-Host ("CONNECT host={0} port={1}" -f $hostName, $port)
+          $body = "host=$hostName`nport=$port`npass=$env:RDP_PASS`n"
+          $b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+          $pf = Join-Path $env:RUNNER_TEMP "pub.json"
+          $json1 = (@{ message = "size25 $($env:GITHUB_RUN_ID)"; content = $b } | ConvertTo-Json -Compress)
+          [IO.File]::WriteAllText($pf, $json1, (New-Object Text.UTF8Encoding($false)))
+          & curl.exe -sS -o NUL -w "publish http=%{http_code}`n" -X PUT `
+            -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
+            -H "Accept: application/vnd.github+json" `
+            -H "Content-Type: application/json" `
+            --data-binary "@$pf" `
+            "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/.box/size25-$($env:GITHUB_RUN_ID).txt"
+
+      - name: build 25GB and upload
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          function G([string]$n, [double]$s, [double]$mb) {
+            $r = if ($s -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
+          }
+          $Work = if (Test-Path "D:\") { "D:\size25" } else { Join-Path $env:RUNNER_TEMP "size25" }
+          New-Item -ItemType Directory -Force -Path $Work | Out-Null
+          $bulk = Join-Path $Work "bulk.bin"
+          $target = [long](24GB)
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(25).NextBytes($buf)
+          $t = Get-Date
+          $fs = [IO.File]::Open($bulk, "Create", "Write", "None")
+          try {
+            $w = [long]0
+            while ($w -lt $target) {
+              $c = [int][Math]::Min([long]$buf.Length, ($target - $w))
+              $fs.Write($buf, 0, $c)
+              $w += $c
+            }
+          } finally { $fs.Close() }
+          $bytes = [long](Get-Item $bulk).Length
+          G "make25" ((Get-Date) - $t).TotalSeconds ($bytes / 1MB)
+          Write-Host ("RESULT bulk_bytes={0}" -f $bytes)
+          Set-Content -Path (Join-Path $Work "README.txt") -Value "25GB test. bulk.bin is the big file." -Encoding UTF8
+
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+          $t = Get-Date
+          & $exe copy $Work "r2:$($env:R2_BUCKET)/size25" --transfers 16 --s3-chunk-size 64M --stats 30s --stats-one-line 2>&1 | Out-Host
+          G "upload25" ((Get-Date) - $t).TotalSeconds ($bytes / 1MB)
+          Write-Host ("RESULT upload_exit={0}" -f $LASTEXITCODE)
+          exit 0
+
+      - name: mount and measure
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
+          curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          Write-Host ("RESULT winfsp_exit={0}" -f $p.ExitCode)
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+          $cache = Join-Path $env:RUNNER_TEMP "vfscache"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP "mount.log"
+          $t = Get-Date
+          $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList @(
+            "mount", "r2:$($env:R2_BUCKET)/size25", "E:",
+            "--vfs-cache-mode", "full", "--cache-dir", $cache,
+            "--links", "--dir-cache-time", "10s", "--transfers", "16",
+            "--file-perms", "0777", "--dir-perms", "0777",
+            "--rc", "--rc-addr", "127.0.0.1:5572",
+            "--log-file", $log, "--log-level", "INFO"
+          )
+          $up = $false
+          for ($i = 0; $i -lt 240; $i++) {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path "E:\") { $up = $true; break }
+            if ($proc.HasExited) { break }
+          }
+          $mountSec = ((Get-Date) - $t).TotalSeconds
+          Write-Host ("GAUGE e_visible seconds={0:N2}" -f $mountSec)
+          Write-Host ("RESULT e_present={0}" -f $up)
+          $top = (Get-ChildItem "E:\" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ","
+          Write-Host ("RESULT e_top={0}" -f $top)
+          $bulkItem = Get-Item "E:\bulk.bin" -ErrorAction SilentlyContinue
+          $gb = if ($bulkItem) { $bulkItem.Length / 1GB } else { 0 }
+          Write-Host ("RESULT bulk_visible_gb={0:N2}" -f $gb)
+
+          $readMB = 0
+          if ($bulkItem) {
+            $t = Get-Date
+            $f = [IO.File]::Open("E:\bulk.bin", "Open", "Read", "Read")
+            $rb = New-Object byte[] (8MB)
+            $got = 0
+            $want = 256MB
+            while ($got -lt $want) {
+              $n = $f.Read($rb, 0, $rb.Length)
+              if ($n -le 0) { break }
+              $got += $n
+            }
+            $f.Close()
+            $rs = ((Get-Date) - $t).TotalSeconds
+            $readMB = $got / 1MB
+            $rmbps = if ($rs -gt 0) { $readMB / $rs } else { 0 }
+            Write-Host ("GAUGE cold_read seconds={0:N2} MBps={1:N1}" -f $rs, $rmbps)
+          }
+
+          $t = Get-Date
+          Set-Content -Path "E:\changed.txt" -Value "changed after boot" -Encoding UTF8
+          & $exe rc vfs/forget --rc-addr 127.0.0.1:5572 2>&1 | Out-Null
+          Start-Sleep -Seconds 5
+          Write-Host ("GAUGE small_write seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
+
+          $res = @(
+            "e_visible_seconds=$([Math]::Round($mountSec,2))",
+            "e_present=$up",
+            "e_top=$top",
+            "bulk_visible_gb=$([Math]::Round($gb,2))",
+            "cold_read_mb=$([Math]::Round($readMB,1))"
+          ) -join "`n"
+          $b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($res))
+          $pf = Join-Path $env:RUNNER_TEMP "res.json"
+          $json = (@{ message = "size25 result"; content = $b } | ConvertTo-Json -Compress)
+          [IO.File]::WriteAllText($pf, $json, (New-Object Text.UTF8Encoding($false)))
+          & curl.exe -sS -o NUL -w "result http=%{http_code}`n" -X PUT `
+            -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
+            -H "Accept: application/vnd.github+json" `
+            -H "Content-Type: application/json" `
+            --data-binary "@$pf" `
+            "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/.box/size25-result-$($env:GITHUB_RUN_ID).txt"
+          "E: is the 25GB disk. Open it." | Set-Content -Path "$env:USERPROFILE\Desktop\LOOK-HERE.txt" -Encoding UTF8
+          Write-Host "=== NOW LOG IN VIA RDP ==="
+          Write-Host "Holding 100 minutes..."
+          Start-Sleep -Seconds 6000
+          Write-Host "SIZE25_DONE"
+          exit 0
