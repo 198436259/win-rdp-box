@@ -51,9 +51,9 @@ $FileTrees = @(
   "AppData\Local\Programs"
 )
 
+# Program Files is handled by apps.ps1 (junction to R2 persists installed apps).
+# Only ProgramData is copied here.
 $MachineTrees = @(
-  "C:\Program Files",
-  "C:\Program Files (x86)",
   "C:\ProgramData"
 )
 
