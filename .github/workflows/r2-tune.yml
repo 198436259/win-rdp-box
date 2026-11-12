@@ -1,0 +1,50 @@
+name: r2-tune
+on: workflow_dispatch
+jobs:
+  tune:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: concurrency sweep on the real 25GB object
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          function W([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f $n) }
+
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          $root = "D:\tune"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $size = [long]27049066496
+
+          foreach ($n in @(16, 32, 64)) {
+            W "download 25GB multi-thread-streams=$n"
+            Get-ChildItem $root -File -ErrorAction SilentlyContinue | Remove-Item -Force
+            $t = Get-Date
+            & $exe copy "r2:$($env:R2_BUCKET)/e.vhdx" $root --local-no-sparse --multi-thread-streams $n --stats 0
+            if ($LASTEXITCODE -ne 0) { throw "download failed at n=$n" }
+            $s = ((Get-Date) - $t).TotalSeconds
+            $got = (Get-ChildItem $root -File | Select-Object -First 1).Length
+            Write-Host ("RESULT mt{0} seconds={1:N1} MBps={2:N1} bytes={3}" -f $n, $s, (($got / 1MB) / $s), $got)
+          }
+
+          Get-ChildItem $root -File -ErrorAction SilentlyContinue | Remove-Item -Force
+          Write-Host "TUNE_DONE"
