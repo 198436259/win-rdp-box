@@ -51,6 +51,19 @@ $FileTrees = @(
   "AppData\Local\Programs"
 )
 
+$MachineTrees = @(
+  "C:\Program Files",
+  "C:\Program Files (x86)",
+  "C:\ProgramData"
+)
+
+$MachineXd = @(
+  "Package Cache", "WER", "Caches", "Windows Defender", "Defender",
+  "USOShared", "USOPrivate", "Downloaded Program Files",
+  "WindowsApps", "SquirrelTemp", "CrashDumps"
+)
+$MachineXf = @("*.etl", "*.dmp")
+
 $LoginTrees = @(
   "AppData\Roaming\Claude",
   "AppData\Roaming\Anthropic",
@@ -75,6 +88,12 @@ $HkcuKeys = @(
   "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
 )
 
+$HklmKeys = @(
+  "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+)
+
 $RoboXd = @(
   "Cache", "Code Cache", "GPUCache", "Crashpad", "Temp", "Temporary Internet Files",
   "CacheStorage", "DawnCache", "GrShaderCache", "ShaderCache", "CachedData",
@@ -97,7 +116,7 @@ function Get-GhHeaders {
 }
 
 function Invoke-CopyTree {
-  param([string]$Src, [string]$Dst)
+  param([string]$Src, [string]$Dst, [string[]]$ExtraXd = @(), [string[]]$ExtraXf = @())
   if (-not (Test-Path $Src)) { return 0 }
   $item = Get-Item $Src -Force
   if (-not $item.PSIsContainer) {
@@ -106,8 +125,8 @@ function Invoke-CopyTree {
     return 1
   }
   New-Item -ItemType Directory -Force -Path $Dst | Out-Null
-  $xd = @($RoboXd)
-  $xf = @($RoboXf)
+  $xd = @($RoboXd) + @($ExtraXd)
+  $xf = @($RoboXf) + @($ExtraXf)
   $args = @($Src, $Dst, "/E", "/XJ", "/R:1", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")
   if ($xd.Count) { $args += @("/XD") + $xd }
   if ($xf.Count) { $args += @("/XF") + $xf }
@@ -182,6 +201,17 @@ function Save-Image {
     $copied += Invoke-CopyTree $src (Join-Path $FilesRoot $rel)
   }
 
+  foreach ($abs in $MachineTrees) {
+    if (-not (Test-Path $abs)) { continue }
+    $leaf = Split-Path $abs -Leaf
+    $dst = Join-Path $Stage ("machine\" + $leaf)
+    $t0 = Get-Date
+    Invoke-CopyTree $abs $dst $MachineXd $MachineXf | Out-Null
+    $files = 0; $bytes = [int64]0
+    Get-ChildItem $dst -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $files++; $bytes += $_.Length }
+    Write-Host ("machine {0} files={1} bytes={2} seconds={3:N1}" -f $leaf, $files, $bytes, ((Get-Date) - $t0).TotalSeconds)
+  }
+
   Get-ChildItem (Join-Path $env:USERPROFILE "AppData\Local\Packages") -Directory -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like "Claude*" } |
     ForEach-Object {
@@ -205,6 +235,15 @@ function Save-Image {
   foreach ($k in $HkcuKeys) {
     $i++
     $out = Join-Path $RegDir ("hkcu-{0:D2}.reg" -f $i)
+    & reg.exe export $k $out /y 2>$null | Out-Null
+    if (Test-Path $out) { $keyCount++ }
+  }
+  $hklmDir = Join-Path $RegDir "HKLM"
+  New-Item -ItemType Directory -Force -Path $hklmDir | Out-Null
+  $j = 0
+  foreach ($k in $HklmKeys) {
+    $j++
+    $out = Join-Path $hklmDir ("hklm-{0:D2}.reg" -f $j)
     & reg.exe export $k $out /y 2>$null | Out-Null
     if (Test-Path $out) { $keyCount++ }
   }
@@ -370,6 +409,22 @@ function Restore-Image {
     }
     Get-ChildItem $RegDir -Filter *.reg -ErrorAction SilentlyContinue | ForEach-Object {
       & reg.exe import $_.FullName 2>$null | Out-Null
+    }
+    $hklmDir = Join-Path $RegDir "HKLM"
+    if (Test-Path $hklmDir) {
+      Get-ChildItem $hklmDir -Filter *.reg -ErrorAction SilentlyContinue | ForEach-Object {
+        & reg.exe import $_.FullName 2>$null | Out-Null
+      }
+    }
+    $machineRoot = Join-Path $Stage "machine"
+    if (Test-Path $machineRoot) {
+      Get-ChildItem $machineRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $dst = Join-Path "C:\" $_.Name
+        New-Item -ItemType Directory -Force -Path $dst | Out-Null
+        $t0 = Get-Date
+        & robocopy $_.FullName $dst /E /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+        Write-Host ("restore machine {0} seconds={1:N1}" -f $_.Name, ((Get-Date) - $t0).TotalSeconds)
+      }
     }
     $varFile = Join-Path $Stage "system\variables.json"
     if (Test-Path $varFile) {
