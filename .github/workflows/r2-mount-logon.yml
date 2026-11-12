@@ -97,7 +97,7 @@ jobs:
           [IO.File]::WriteAllText((Join-Path $conf "rclone.conf"), $confText)
 
           $exe = Join-Path $conf "rclone.exe"
-          $argText = "mount r2:$($env:R2_BUCKET) E: --config `"$conf\rclone.conf`" --vfs-cache-mode full --dir-cache-time 10s --log-file `"$conf\mount.log`" --log-level INFO"
+          $argText = "mount r2:$($env:R2_BUCKET) E: --config `"$conf\rclone.conf`" --vfs-cache-mode full --links --dir-cache-time 10s --log-file `"$conf\mount.log`" --log-level INFO"
           [IO.File]::WriteAllText((Join-Path $conf "mount.cmd"), "@echo off`r`n`"$exe`" $argText`r`n")
 
           $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$conf\mount.cmd`""
@@ -126,5 +126,5 @@ jobs:
           Write-Host "In that RDP window run:"
           Write-Host "  Test-Path E:\ ; Get-ChildItem E:\ ; Get-Content C:\rcloneconf\mount.log -Tail 20"
           Write-Host "Holding 25 minutes..."
-          Start-Sleep -Seconds 1500
+          Start-Sleep -Seconds 3300
           Write-Host "LOGON_PROBE_DONE"
