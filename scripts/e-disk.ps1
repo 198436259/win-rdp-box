@@ -72,8 +72,8 @@ function Invoke-RcloneRc {
   $ErrorActionPreference = "Continue"
   try {
     $job = Start-Job -ScriptBlock {
-      param($exe, $args, $addr)
-      & $exe rc @args --rc-addr $addr --json 2>&1
+      param($exe, $rcArgs, $addr)
+      & $exe rc @rcArgs --rc-addr $addr --json 2>&1
     } -ArgumentList $exe, $RcArgs, $RcAddr
     $done = Wait-Job $job -Timeout $TimeoutSec
     if (-not $done) {
@@ -143,7 +143,7 @@ function Wait-VfsDrained {
     $json = (Invoke-RcloneRc -RcArgs @("vfs/stats") -TimeoutSec 20) -join ""
     $pending = -1
     $inflight = -1
-    if ($json -match '"pendingUploads"\s*:\s*(\d+)') { $pending = [int]$Matches[1] }
+    if ($json -match '"uploadsQueued"\s*:\s*(\d+)') { $pending = [int]$Matches[1] }
     if ($json -match '"uploadsInProgress"\s*:\s*(\d+)') { $inflight = [int]$Matches[1] }
     if ($pending -eq 0 -and $inflight -eq 0) { return $true }
     if ($pending -lt 0 -and $inflight -lt 0) {
