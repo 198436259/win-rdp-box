@@ -28,6 +28,14 @@ jobs:
           if (-not (Test-Path "E:\")) { Write-Host "MOUNT_FAILED"; exit 0 }
           $top = (Get-ChildItem "E:\" | Select-Object -ExpandProperty Name) -join ","
           Write-Host ("RESULT e_top={0}" -f $top)
+          $rcexe = Get-ChildItem (Join-Path $env:RUNNER_TEMP "..") -Recurse -Filter rclone.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $rcexe) { $rcexe = Get-ChildItem "D:\e-disk" -Recurse -Filter rclone.exe -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if ($rcexe) {
+            $st = (& $rcexe.FullName rc vfs/stats --rc-addr 127.0.0.1:5572 --json 2>$null | Out-String)
+            $stOne = ($st -replace "\s+", " ")
+            if ($stOne.Length -gt 600) { $stOne = $stOne.Substring(0, 600) }
+            Write-Host ("RESULT vfs_stats_raw=" + $stOne)
+          }
 
           $deltaMB = [int]$env:DELTA_MB
           if (-not $deltaMB) { $deltaMB = 300 }
