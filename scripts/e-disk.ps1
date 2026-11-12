@@ -45,8 +45,13 @@ function Set-RcloneR2Env {
   $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
 }
 
+function Get-R2Key {
+  if ($env:R2_VHD_KEY) { return $env:R2_VHD_KEY }
+  return "e.vhdx"
+}
+
 function Get-R2Vhd {
-  return "r2:$($env:R2_BUCKET)/e.vhdx"
+  return "r2:$($env:R2_BUCKET)/$(Get-R2Key)"
 }
 
 function Test-Sparse([string]$path) {
@@ -216,7 +221,8 @@ function Invoke-Mount {
   Write-Host "e-disk: trying download e.vhdx"
   $got = $false
   try {
-    Invoke-Rclone @("copy", $remote, (Split-Path $Vhd), "--progress", "--local-no-sparse") | Out-Null
+    # 16 parallel streams: measured 25GB download 546s -> 295s (49.5 -> 87.5 MB/s).
+    Invoke-Rclone @("copy", $remote, (Split-Path $Vhd), "--progress", "--local-no-sparse", "--multi-thread-streams", "16") | Out-Null
     if ((Test-Path $Vhd) -and ((Get-Item $Vhd).Length -gt 1MB)) { $got = $true }
   } catch {
     Write-Host "e-disk: download failed: $_"
@@ -243,8 +249,8 @@ function Invoke-Save {
   if (-not (Test-Path $Vhd)) { throw "D:\e.vhdx missing, skip upload not allowed" }
   Write-Host "e-disk: uploading bytes=$((Get-Item $Vhd).Length)"
   # 64MiB chunks: fewer Class A ops per save (R2 bills $4.50/million writes).
-  Invoke-Rclone @("copy", $Vhd, "r2:$($env:R2_BUCKET)/", "--progress", "--s3-chunk-size", "64M") | Out-Null
-  Invoke-Rclone @("ls", "r2:$($env:R2_BUCKET)/e.vhdx") | Out-Null
+  Invoke-Rclone @("copyto", $Vhd, (Get-R2Vhd), "--progress", "--s3-chunk-size", "64M") | Out-Null
+  Invoke-Rclone @("ls", (Get-R2Vhd)) | Out-Null
   Write-Host "e-disk: uploaded e.vhdx"
 }
 
