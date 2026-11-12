@@ -17,7 +17,7 @@ $SkipNames = @(
   "Windows Sidebar", "WindowsPowerShell", "ModifiableWindowsApps",
   "Internet Explorer", "Uninstall Information", "Reference Assemblies",
   "MSBuild", "dotnet", "Microsoft", "Microsoft Update Health Tools",
-  "Common Files", "Desktop.ini"
+  "Common Files", "Desktop.ini", "WinFsp"
 )
 
 $Roots = @(
