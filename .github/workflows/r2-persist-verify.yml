@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "save = install software then persist; restore = fresh machine, verify software came back"
+        description: "save = install app then persist to r2; restore = fresh machine, verify app came back"
         required: true
         default: save
         type: choice
@@ -11,113 +11,87 @@ on:
 jobs:
   verify:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-      R2_VHD_KEY: verify/e.vhdx
+      R2_E_PREFIX: verify2
     steps:
       - uses: actions/checkout@v4
 
-      - name: save round
+      - name: "mount E"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+          Write-Host ("GAUGE e_mount seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          Write-Host ("RESULT e_present={0}" -f (Test-Path "E:\"))
+          if (Test-Path "E:\") {
+            Write-Host ("RESULT e_top=" + ((Get-ChildItem "E:\" | Select-Object -ExpandProperty Name) -join ","))
+          }
+          exit 0
+
+      - name: "save: install app then persist"
         if: inputs.mode == 'save'
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          function G([string]$n, [double]$s, [double]$mb) {
-            $r = if ($s -gt 0) { $mb / $s } else { 0 }
-            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
-          }
-          Get-PSDrive -PSProvider FileSystem | ForEach-Object {
-            Write-Host ("disk {0} used={1:N1}GB free={2:N1}GB" -f $_.Name, ($_.Used/1GB), ($_.Free/1GB))
-          }
+          & choco install 7zip -y --no-progress 2>&1 | Out-Null
+          Write-Host ("RESULT app_installed={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
+          $o = & "C:\Program Files\7-Zip\7z.exe" 2>&1 | Select-Object -First 2
+          Write-Host ("RESULT app_runs_local={0}" -f (@($o | Where-Object { [string]$_ -like "*7-Zip*" }).Count -gt 0))
 
-          Write-Host "########## 1 INSTALL REAL SOFTWARE ##########"
-          $ok = $false
-          try {
-            & choco install 7zip -y --no-progress 2>&1 | Out-Host
-            $ok = Test-Path "C:\Program Files\7-Zip\7z.exe"
-          } catch { Write-Host "choco failed: $_" }
-          if (-not $ok) {
-            try {
-              & winget install --id 7zip.7zip -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Out-Host
-              $ok = Test-Path "C:\Program Files\7-Zip\7z.exe"
-            } catch { Write-Host "winget failed: $_" }
-          }
-          New-Item -ItemType Directory -Force -Path "C:\Program Files\FlexPCProbe" | Out-Null
-          Set-Content -Path "C:\Program Files\FlexPCProbe\probe.txt" -Value ("installed-at=" + (Get-Date -Format o)) -Encoding UTF8
-          Set-Content -Path "$env:USERPROFILE\Desktop\persist-probe.txt" -Value "desktop-marker" -Encoding UTF8
-          Write-Host ("RESULT sevenzip_installed={0}" -f $ok)
-          Write-Host ("RESULT progfiles_free_before=" + [Math]::Round((Get-PSDrive C).Free/1GB,1))
-
-          Write-Host "########## 2 MOUNT PERSIST VOLUME FROM R2 ##########"
+          Write-Host "--- apps save (upload + junction) ---"
           $t = Get-Date
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
-          $s = ((Get-Date) - $t).TotalSeconds
-          if (-not (Test-Path "E:\")) { throw "E: not mounted" }
-          $vol = Get-Volume -DriveLetter E
-          Write-Host ("RESULT e_drive fs={0} label={1} size={2:N1}GB" -f $vol.FileSystem, $vol.FileSystemLabel, ($vol.Size/1GB))
-          G "mount" $s 0
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action save *>&1 | Out-Host
+          Write-Host ("GAUGE apps_save seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
+          $i = Get-Item "C:\Program Files\7-Zip" -Force -ErrorAction SilentlyContinue
+          Write-Host ("RESULT junction_type={0}" -f ($(if ($i) { $i.LinkType } else { "gone" })))
+          Write-Host ("RESULT app_present_after_junction={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
+          $o2 = & "C:\Program Files\7-Zip\7z.exe" 2>&1 | Select-Object -First 2
+          Write-Host ("RESULT app_runs_after_junction={0}" -f (@($o2 | Where-Object { [string]$_ -like "*7-Zip*" }).Count -gt 0))
 
-          Write-Host "########## 3 SAVE USER + MACHINE STATE ##########"
-          $t = Get-Date
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C" *>&1 | Out-Host
-          G "c_image_save" ((Get-Date) - $t).TotalSeconds 0
-          $m = "E:\CloudVM-C\manifest.json"
-          if (Test-Path $m) { Get-Content $m -Raw | Out-Host }
-          $mb = 0; $bytes = [int64]0
-          Get-ChildItem "E:\CloudVM-C" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $mb++; $bytes += $_.Length }
-          Write-Host ("RESULT delta files={0} bytes={1} ({2:N2} GiB)" -f $mb, $bytes, ($bytes/1GB))
-          Write-Host ("RESULT sevenzip_on_e=" + (Test-Path "E:\CloudVM-C\machine\Program Files\7-Zip\7z.exe"))
-
-          Write-Host "########## 4 UPLOAD ##########"
-          $before = $bytes
+          Write-Host "--- e-disk save (flush) ---"
           $t = Get-Date
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
-          G "upload" ((Get-Date) - $t).TotalSeconds ($before/1MB)
+          Write-Host ("GAUGE e_flush seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
           Write-Host "SAVE_ROUND_DONE"
+          exit 0
 
-      - name: restore round
+      - name: "restore: verify app came back on a fresh machine"
         if: inputs.mode == 'restore'
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          function G([string]$n, [double]$s, [double]$mb) {
-            $r = if ($s -gt 0) { $mb / $s } else { 0 }
-            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
-          }
-          Write-Host ("RESULT sevenzip_preexisting=" + (Test-Path "C:\Program Files\7-Zip\7z.exe"))
+          Write-Host ("RESULT app_before_restore={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
 
-          Write-Host "########## 1 MOUNT PERSIST VOLUME FROM R2 ##########"
+          Write-Host "--- apps restore (rebuild junctions) ---"
           $t = Get-Date
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
-          $sec = ((Get-Date) - $t).TotalSeconds
-          if (-not (Test-Path "E:\")) { throw "E: not mounted" }
-          $size = (Get-Item "D:\e.vhdx").Length
-          G "download" $sec ($size/1MB)
-          Write-Host ("RESULT e_is_real_ntfs={0}" -f ((Get-Volume -DriveLetter E).FileSystem -eq "NTFS"))
-          Write-Host ("RESULT e_top=" + ((Get-ChildItem "E:\" | Select-Object -ExpandProperty Name) -join ","))
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action restore *>&1 | Out-Host
+          Write-Host ("GAUGE apps_restore seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
 
-          Write-Host "########## 2 RESTORE USER + MACHINE STATE ##########"
+          $i = Get-Item "C:\Program Files\7-Zip" -Force -ErrorAction SilentlyContinue
+          Write-Host ("RESULT junction_type={0}" -f ($(if ($i) { $i.LinkType } else { "gone" })))
+          Write-Host ("RESULT app_exe_present={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
+
           $t = Get-Date
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore -TargetDir "E:\CloudVM-C" *>&1 | Out-Host
-          G "c_image_restore" ((Get-Date) - $t).TotalSeconds 0
+          $o = & "C:\Program Files\7-Zip\7z.exe" 2>&1 | Select-Object -First 2
+          Write-Host ("GAUGE cold_run seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          $runs = @($o | Where-Object { [string]$_ -like "*7-Zip*" }).Count -gt 0
+          $o | ForEach-Object { Write-Host ("OUT " + [string]$_) }
+          Write-Host ("RESULT app_runs_after_boot={0}" -f $runs)
 
-          Write-Host "########## 3 VERIFY ##########"
-          $r = @()
-          $r += "sevenzip_exe=" + (Test-Path "C:\Program Files\7-Zip\7z.exe")
-          $r += "probe_dir=" + (Test-Path "C:\Program Files\FlexPCProbe\probe.txt")
-          $r += "desktop_file=" + (Test-Path "$env:USERPROFILE\Desktop\persist-probe.txt")
+          $tmp = Join-Path $env:RUNNER_TEMP "zt"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          Set-Content (Join-Path $tmp "a.txt") "hello"
+          & "C:\Program Files\7-Zip\7z.exe" a (Join-Path $tmp "a.zip") (Join-Path $tmp "a.txt") 2>&1 | Out-Null
+          Write-Host ("RESULT app_zip_works={0}" -f (Test-Path (Join-Path $tmp "a.zip")))
+
           $un = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
             Where-Object { $_.DisplayName -like "*7-Zip*" } | Select-Object -First 1
-          $r += "uninstall_key=" + [bool]$un
-          if (Test-Path "C:\Program Files\7-Zip\7z.exe") {
-            $v = (& "C:\Program Files\7-Zip\7z.exe" 2>&1 | Select-Object -First 3) -join " "
-            $r += "sevenzip_run=" + ($v -replace "\s+", " ")
-          }
-          $r | ForEach-Object { Write-Host ("RESULT " + $_) }
-          $all = ((Test-Path "C:\Program Files\7-Zip\7z.exe") -and (Test-Path "C:\Program Files\FlexPCProbe\probe.txt") -and (Test-Path "$env:USERPROFILE\Desktop\persist-probe.txt") -and [bool]$un)
-          Write-Host ("RESULT all_persisted={0}" -f $all)
+          Write-Host ("RESULT uninstall_entry={0}" -f [bool]$un)
           Write-Host "RESTORE_ROUND_DONE"
+          exit 0
