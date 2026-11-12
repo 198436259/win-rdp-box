@@ -191,6 +191,34 @@ function Get-LoginApps {
   return @($apps)
 }
 
+function Get-BootBaselineProgramData {
+  $work = if (Test-Path "D:\") { "D:\e-disk" } else { Join-Path $WorkRoot "e-disk" }
+  $bp = Join-Path $work "boot-baseline.json"
+  if (Test-Path $bp) {
+    try {
+      $obj = Get-Content $bp -Raw | ConvertFrom-Json
+      return @($obj.ProgramData)
+    } catch {}
+  }
+  return @()
+}
+
+function Ensure-BootBaselineIfMissing {
+  $work = if (Test-Path "D:\") { "D:\e-disk" } else { Join-Path $WorkRoot "e-disk" }
+  $bp = Join-Path $work "boot-baseline.json"
+  if (Test-Path $bp) { return }
+  New-Item -ItemType Directory -Force -Path $work | Out-Null
+  $pf = @(Get-ChildItem "C:\Program Files" -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.LinkType -ne "Junction" } | Select-Object -ExpandProperty Name)
+  $pfx86 = @(Get-ChildItem "C:\Program Files (x86)" -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.LinkType -ne "Junction" } | Select-Object -ExpandProperty Name)
+  $pd = @(Get-ChildItem "C:\ProgramData" -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.LinkType -ne "Junction" } | Select-Object -ExpandProperty Name)
+  [pscustomobject]@{
+    capturedAt      = [DateTime]::UtcNow.ToString("o")
+    ProgramFiles    = $pf
+    ProgramFilesX86 = $pfx86
+    ProgramData     = $pd
+  } | ConvertTo-Json -Depth 4 | Set-Content -Path $bp -Encoding UTF8
+}
+
 function Save-Image {
   if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
   New-Item -ItemType Directory -Force -Path $FilesRoot, $RegDir, $LoginRoot | Out-Null
@@ -201,12 +229,22 @@ function Save-Image {
     $copied += Invoke-CopyTree $src (Join-Path $FilesRoot $rel)
   }
 
+  $basePd = @(Get-BootBaselineProgramData)
   foreach ($abs in $MachineTrees) {
     if (-not (Test-Path $abs)) { continue }
     $leaf = Split-Path $abs -Leaf
     $dst = Join-Path $Stage ("machine\" + $leaf)
     $t0 = Get-Date
-    Invoke-CopyTree $abs $dst $MachineXd $MachineXf | Out-Null
+    if ($leaf -eq "ProgramData" -and $basePd.Count -gt 0) {
+      New-Item -ItemType Directory -Force -Path $dst | Out-Null
+      Get-ChildItem $abs -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        if (($basePd -notcontains $_.Name) -and ($MachineXd -notcontains $_.Name)) {
+          Invoke-CopyTree $_.FullName (Join-Path $dst $_.Name) $MachineXd $MachineXf | Out-Null
+        }
+      }
+    } else {
+      Invoke-CopyTree $abs $dst $MachineXd $MachineXf | Out-Null
+    }
     $files = 0; $bytes = [int64]0
     Get-ChildItem $dst -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $files++; $bytes += $_.Length }
     Write-Host ("machine {0} files={1} bytes={2} seconds={3:N1}" -f $leaf, $files, $bytes, ((Get-Date) - $t0).TotalSeconds)
@@ -274,10 +312,24 @@ function Save-Image {
       logins    = $logins
       note      = "User-state delta on persist volume. Not a full C: image."
     }
-    $manifestEarly | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $Stage "manifest.json") -Encoding UTF8
-    & robocopy $Stage $TargetDir /MIR /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    $manifestPath = Join-Path $Stage "manifest.json"
+    $manifestEarly | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestPath -Encoding UTF8
+    $localTar = Join-Path $Work "c-delta.tar"
+    if (Test-Path $localTar) { Remove-Item $localTar -Force -ErrorAction SilentlyContinue }
+    $tarSaved = $false
+    try {
+      & tar.exe -cf $localTar -C $Stage . 2>$null
+      if ((Test-Path $localTar) -and ((Get-Item $localTar).Length -gt 0)) {
+        Copy-Item $localTar (Join-Path $TargetDir "c-delta.tar") -Force
+        Copy-Item $manifestPath (Join-Path $TargetDir "manifest.json") -Force
+        $tarSaved = $true
+      }
+    } catch {}
+    if (-not $tarSaved) {
+      & robocopy $Stage $TargetDir /MIR /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    }
     $loginHint = if ($logins.Count) { " logins=" + (($logins | ForEach-Object { $_.app }) -join ",") } else { "" }
-    Write-Host ("c-delta dir={0} files={1} keys={2} variables={3}{4}" -f $TargetDir, $fileCount, $keyCount, $varCount, $loginHint)
+    Write-Host ("c-delta dir={0} tar={1} files={2} keys={3} variables={4}{5}" -f $TargetDir, $tarSaved, $fileCount, $keyCount, $varCount, $loginHint)
     return
   }
   $manifest = [pscustomobject]@{
@@ -344,10 +396,28 @@ function Save-Image {
 }
 
 function Restore-Image {
+  Ensure-BootBaselineIfMissing
   $fromDir = $false
   if ($TargetDir -and (Test-Path (Join-Path $TargetDir "manifest.json"))) {
     Write-Host "restore from $TargetDir"
-    $Stage = $TargetDir
+    $remoteTar = Join-Path $TargetDir "c-delta.tar"
+    $extracted = $false
+    if (Test-Path $remoteTar) {
+      try {
+        if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+        $localTar = Join-Path $Work "c-delta.tar"
+        Copy-Item $remoteTar $localTar -Force
+        & tar.exe -xf $localTar -C $Stage 2>$null
+        if (Get-ChildItem $Stage -ErrorAction SilentlyContinue) {
+          $extracted = $true
+          Write-Host "restored stage from c-delta.tar"
+        }
+      } catch {}
+    }
+    if (-not $extracted) {
+      $Stage = $TargetDir
+    }
     $FilesRoot = Join-Path $Stage "system\files"
     $RegDir = Join-Path $Stage "system\registry"
     $LoginRoot = Join-Path $Stage "logins"
