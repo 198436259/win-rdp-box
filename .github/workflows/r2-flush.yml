@@ -1,0 +1,91 @@
+name: r2-flush
+on: workflow_dispatch
+jobs:
+  f:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: "1 setup"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
+          curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          Write-Host ("RESULT winfsp_exit={0}" -f $p.ExitCode)
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          Write-Host "RESULT setup_done"
+          exit 0
+
+      - name: "2 mount with perms rc, write, graceful unmount via rc"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $exe = Get-ChildItem (Join-Path $env:RUNNER_TEMP "rclone") -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          $cache = Join-Path $env:RUNNER_TEMP "vfscache"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP "m.log"
+          $t = Get-Date
+          $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList @(
+            "mount", "r2:$($env:R2_BUCKET)/apps", "E:",
+            "--vfs-cache-mode", "full", "--cache-dir", $cache,
+            "--links", "--dir-cache-time", "10s", "--transfers", "16",
+            "--file-perms", "0777", "--dir-perms", "0777",
+            "--rc", "--rc-addr", "127.0.0.1:5572",
+            "--log-file", $log, "--log-level", "INFO"
+          )
+          for ($i = 0; $i -lt 240; $i++) { Start-Sleep -Milliseconds 250; if (Test-Path "E:\") { break } }
+          Write-Host ("GAUGE mount_visible seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          Write-Host ("RESULT mount_up={0}" -f (Test-Path "E:\"))
+
+          $t = Get-Date
+          Set-Content -Path "E:\ProgramFiles\7-Zip\flush-a.txt" -Value "flush test A" -Encoding UTF8
+          Set-Content -Path "E:\ProgramFiles\7-Zip\flush-b.txt" -Value "flush test B" -Encoding UTF8
+          Write-Host ("GAUGE write_two seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+
+          Write-Host "--- wait for pending uploads to drain ---"
+          $drained = $false
+          $t = Get-Date
+          for ($i = 0; $i -lt 120; $i++) {
+            $s = (& $exe rc vfs/stats --rc-addr 127.0.0.1:5572 --json 2>$null | Out-String)
+            if ($s -match '"pendingUploads"\s*:\s*0' -and $s -match '"uploadsInProgress"\s*:\s*0') { $drained = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          Write-Host ("GAUGE drain_pending seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          Write-Host ("RESULT drained={0}" -f $drained)
+
+          Write-Host "--- graceful unmount via rc ---"
+          $t = Get-Date
+          & $exe rc mount/unmount mountPoint="E:" --rc-addr 127.0.0.1:5572 --json 2>&1 | Out-Host
+          $gone = $false
+          for ($i = 0; $i -lt 60; $i++) { Start-Sleep -Milliseconds 250; if (-not (Test-Path "E:\")) { $gone = $true; break } }
+          Write-Host ("GAUGE unmount seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          Write-Host ("RESULT unmounted={0}" -f $gone)
+          Write-Host ("RESULT process_exited={0}" -f $proc.HasExited)
+
+          Write-Host "--- verify both files in r2 ---"
+          $a = (& $exe cat "r2:$($env:R2_BUCKET)/apps/ProgramFiles/7-Zip/flush-a.txt" 2>$null) -join ""
+          $b = (& $exe cat "r2:$($env:R2_BUCKET)/apps/ProgramFiles/7-Zip/flush-b.txt" 2>$null) -join ""
+          Write-Host ("RESULT flush_a_in_r2={0}" -f ($a -like "*flush test A*"))
+          Write-Host ("RESULT flush_b_in_r2={0}" -f ($b -like "*flush test B*"))
+          & $exe delete "r2:$($env:R2_BUCKET)/apps/ProgramFiles/7-Zip/flush-a.txt" 2>$null | Out-Null
+          & $exe delete "r2:$($env:R2_BUCKET)/apps/ProgramFiles/7-Zip/flush-b.txt" 2>$null | Out-Null
+          Write-Host "FLUSH_DONE"
+          exit 0
