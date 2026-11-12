@@ -66,28 +66,38 @@ function Get-RemoteRoot {
 }
 
 function Invoke-RcloneRc {
-  param([string[]]$RcArgs, [int]$TimeoutSec = 30)
+  # Direct call: vfs/stats and vfs/forget return immediately.
+  param([string[]]$RcArgs)
   $exe = Get-RcloneExe
   $old = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
-    $job = Start-Job -ScriptBlock {
-      param($exe, $rcArgs, $addr)
-      & $exe rc @rcArgs --rc-addr $addr --json 2>&1
-    } -ArgumentList $exe, $RcArgs, $RcAddr
-    $done = Wait-Job $job -Timeout $TimeoutSec
-    if (-not $done) {
-      Stop-Job $job -ErrorAction SilentlyContinue
-      Remove-Job $job -Force -ErrorAction SilentlyContinue
-      Write-Host ("e-disk: rc timed out after {0}s: {1}" -f $TimeoutSec, ($RcArgs -join " "))
-      return @()
-    }
-    $out = Receive-Job $job
-    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    $out = & $exe rc @RcArgs --rc-addr $RcAddr --json 2>&1
     return @($out | Where-Object { [string]$_ -notmatch "NOTICE" })
   } finally {
     $ErrorActionPreference = $old
   }
+}
+
+function Invoke-RcloneRcWithTimeout {
+  # mount/unmount can block on Windows; give it a hard ceiling in a child process.
+  param([string[]]$RcArgs, [int]$TimeoutSec = 60)
+  $exe = Get-RcloneExe
+  $outFile = Join-Path $Work "rc-out.txt"
+  if (Test-Path $outFile) { Remove-Item $outFile -Force -ErrorAction SilentlyContinue }
+  $argLine = (@("rc") + $RcArgs + @("--rc-addr", $RcAddr, "--json")) -join " "
+  $p = Start-Process -FilePath $exe -ArgumentList $argLine -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput $outFile -RedirectStandardError "$outFile.err"
+  $done = $p.WaitForExit($TimeoutSec * 1000)
+  if (-not $done) {
+    try { $p.Kill() } catch {}
+    Write-Host ("e-disk: rc timed out after {0}s: {1}" -f $TimeoutSec, ($RcArgs -join " "))
+    return @()
+  }
+  if (Test-Path $outFile) {
+    return @(Get-Content $outFile -Raw -ErrorAction SilentlyContinue)
+  }
+  return @()
 }
 
 function Invoke-Mount {
@@ -140,14 +150,15 @@ function Wait-VfsDrained {
   $t0 = Get-Date
   $lastLog = -1
   while ($true) {
-    $json = (Invoke-RcloneRc -RcArgs @("vfs/stats") -TimeoutSec 20) -join ""
+    $json = (Invoke-RcloneRc -RcArgs @("vfs/stats")) -join ""
     $pending = -1
     $inflight = -1
     if ($json -match '"uploadsQueued"\s*:\s*(\d+)') { $pending = [int]$Matches[1] }
     if ($json -match '"uploadsInProgress"\s*:\s*(\d+)') { $inflight = [int]$Matches[1] }
     if ($pending -eq 0 -and $inflight -eq 0) { return $true }
     if ($pending -lt 0 -and $inflight -lt 0) {
-      Write-Host "e-disk: vfs/stats unreadable, cannot confirm drain"
+      $head = if ($json.Length -gt 300) { $json.Substring(0, 300) } else { $json }
+      Write-Host ("e-disk: vfs/stats unreadable, cannot confirm drain: " + $head)
       return $false
     }
     $el = [int]((Get-Date) - $t0).TotalSeconds
@@ -179,7 +190,7 @@ function Invoke-Save {
     throw "e-disk: uploads did not finish, refusing to unmount"
   }
 
-  Invoke-RcloneRc @("mount/unmount", "mountPoint=${Letter}:") | Out-Null
+  Invoke-RcloneRcWithTimeout -RcArgs @("mount/unmount", "mountPoint=${Letter}:") -TimeoutSec 120 | Out-Null
   $gone = $false
   for ($i = 0; $i -lt 240; $i++) {
     Start-Sleep -Milliseconds 250
@@ -187,7 +198,7 @@ function Invoke-Save {
   }
   if (-not $gone) {
     Write-Host "e-disk: unmount did not release the drive, retrying once"
-    Invoke-RcloneRc @("mount/unmount", "mountPoint=${Letter}:") | Out-Null
+    Invoke-RcloneRcWithTimeout -RcArgs @("mount/unmount", "mountPoint=${Letter}:") -TimeoutSec 120 | Out-Null
     for ($i = 0; $i -lt 240; $i++) {
       Start-Sleep -Milliseconds 250
       if (-not (Test-Path "${Letter}:\")) { $gone = $true; break }
