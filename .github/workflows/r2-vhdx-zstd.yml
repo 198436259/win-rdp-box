@@ -1,0 +1,215 @@
+name: r2-vhdx-zstd
+on: workflow_dispatch
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Full benchmark: 25GB VHDX + Zstd parallel + Differencing VHDX delta save"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          function G([string]$n, [double]$s, [double]$mb = 0) {
+            $r = if ($s -gt 0 -and $mb -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N2} MBps={2:N1}" -f $n, $s, $r)
+          }
+
+          Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+            Write-Host ("DRIVE {0}: free_gb={1:N2} used_gb={2:N2}" -f $_.Name, ($_.Free / 1GB), ($_.Used / 1GB))
+          }
+
+          $WorkVhd = if ((Test-Path "D:\") -and ((Get-PSDrive D).Free -gt 35GB)) { "D:\vhdx-bench" } else { "C:\vhdx-bench" }
+          $WorkZst = if ((Get-PSDrive C).Free -gt 20GB) { "C:\vhdx-zst" } else { $WorkVhd }
+          New-Item -ItemType Directory -Force -Path $WorkVhd, $WorkZst | Out-Null
+
+          # 1. Setup rclone and zstd
+          $rdir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $rdir | Out-Null
+          $rzip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $rzip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $rzip $rdir -Force
+          $rclone = (Get-ChildItem $rdir -Recurse -Filter rclone.exe | Select-Object -First 1).FullName
+
+          $zdir = Join-Path $env:RUNNER_TEMP "zstd"
+          New-Item -ItemType Directory -Force -Path $zdir | Out-Null
+          $zzip = Join-Path $env:RUNNER_TEMP "zstd.zip"
+          curl.exe -fsSL -o $zzip "https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-v1.5.6-win64.zip"
+          Expand-Archive $zzip $zdir -Force
+          $zstd = (Get-ChildItem $zdir -Recurse -Filter zstd.exe | Select-Object -First 1).FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+          $remote = "r2:$($env:R2_BUCKET)/vhdx-zstd-bench"
+
+          # 2. Create 100GB Dynamic VHDX (base.vhdx) and fill with 25.0 GB realistic compressible data (~40% ratio like HourlyPC)
+          $BaseVhd = Join-Path $WorkVhd "base.vhdx"
+          $BaseZst = Join-Path $WorkZst "base.vhdx.zst"
+          $DiffVhd = Join-Path $WorkVhd "diff.vhdx"
+          $DiffZst = Join-Path $WorkZst "diff.vhdx.zst"
+
+          New-VHD -Path $BaseVhd -SizeBytes 100GB -Dynamic | Out-Null
+          $img = Mount-DiskImage -ImagePath $BaseVhd -PassThru
+          $disk = $img | Get-Disk
+          Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru |
+            New-Partition -UseMaximumSize -DriveLetter "E" |
+            Format-Volume -FileSystem NTFS -NewFileSystemLabel "persist" -Confirm:$false | Out-Null
+
+          Write-Host "=== FILLING 25.0 GB REALISTIC DATA ON E: (40% entropy + 60% structured code/binary blocks) ==="
+          $tFill = Get-Date
+          # 8MB buffer: first 3.2MB random (~40%), remaining 4.8MB structured repeatable pattern (~60%)
+          $buf = New-Object byte[] (8MB)
+          $rnd = [Random]::new(2026)
+          $rndPart = New-Object byte[] (3355443)
+          $hdr = New-Object byte[] 64
+          $rnd.NextBytes($rndPart)
+          [Array]::Copy($rndPart, 0, $buf, 0, $rndPart.Length)
+          for ($k = $rndPart.Length; $k -lt $buf.Length; $k++) {
+            $buf[$k] = [byte](($k * 31 + ($k -shr 8)) -band 0xFF)
+          }
+
+          $targetBytes = [long](25GB)
+          $fs = [IO.File]::Open("E:\workspace-25gb.dat", "Create", "Write", "None")
+          $w = [long]0
+          while ($w -lt $targetBytes) {
+            # Mutate 64-byte header per 8MB block so blocks are distinct while zstd compresses at ~40%
+            $rnd.NextBytes($hdr)
+            [Array]::Copy($hdr, 0, $buf, 0, 64)
+            $fs.Write($buf, 0, $buf.Length)
+            $w += $buf.Length
+          }
+          $fs.Close()
+          Set-Content -Path "E:\marker-base.txt" -Value "base_25gb_ok" -Encoding UTF8
+          G "fill_25gb_local_vhdx" ((Get-Date) - $tFill).TotalSeconds ($targetBytes / 1MB)
+
+          Dismount-DiskImage -ImagePath $BaseVhd | Out-Null
+          Start-Sleep -Seconds 2
+          $rawVhdBytes = (Get-Item $BaseVhd).Length
+          $rawVhdMB = $rawVhdBytes / 1MB
+          Write-Host ("RESULT base_vhdx_raw_gb={0:N2} bytes={1}" -f ($rawVhdBytes / 1GB), $rawVhdBytes)
+
+          # 3. STAGE A: HourlyPC-style Full Save (Compress 25.4GB VHDX with zstd -1 -T0 + Upload to R2)
+          Write-Host "=== STAGE A: FULL 25GB VHDX ZSTD SAVE ==="
+          $tFullSave = Get-Date
+
+          $tComp = Get-Date
+          & $zstd -q -1 -T0 -f $BaseVhd -o $BaseZst
+          if ($LASTEXITCODE -ne 0) { throw "zstd compress base failed ($LASTEXITCODE)" }
+          $compSec = ((Get-Date) - $tComp).TotalSeconds
+          $zstBytes = (Get-Item $BaseZst).Length
+          $zstMB = $zstBytes / 1MB
+          G "base_zstd_compress" $compSec $rawVhdMB
+          Write-Host ("RESULT base_zst_gb={0:N2} ratio={1:P1} bytes={2}" -f ($zstBytes / 1GB), ($zstBytes / [double]$rawVhdBytes), $zstBytes)
+
+          $tUp = Get-Date
+          & $rclone copy $BaseZst $remote --s3-chunk-size 64M --s3-upload-concurrency 16 --stats 0
+          if ($LASTEXITCODE -ne 0) { throw "rclone upload base.vhdx.zst failed ($LASTEXITCODE)" }
+          $upSec = ((Get-Date) - $tUp).TotalSeconds
+          G "base_zst_upload_r2" $upSec $zstMB
+          G "stageA_full_save_total_raw_equiv" ((Get-Date) - $tFullSave).TotalSeconds $rawVhdMB
+
+          # 4. STAGE B: Cold Boot Restore (Download base.vhdx.zst + Decompress + Attach Differencing VHDX as E:)
+          Write-Host "=== STAGE B: COLD BOOT RESTORE (25GB VHDX) ==="
+          Remove-Item $BaseVhd, $BaseZst -Force
+          $tBoot = Get-Date
+
+          $tDown = Get-Date
+          & $rclone copy "$remote/base.vhdx.zst" $WorkZst --local-no-sparse --multi-thread-streams 16 --stats 0
+          if ($LASTEXITCODE -ne 0) { throw "rclone download base.vhdx.zst failed ($LASTEXITCODE)" }
+          $downSec = ((Get-Date) - $tDown).TotalSeconds
+          G "boot_download_base_zst" $downSec $zstMB
+
+          $tDecomp = Get-Date
+          & $zstd -q -d -T0 -f $BaseZst -o $BaseVhd
+          if ($LASTEXITCODE -ne 0) { throw "zstd decompress base failed ($LASTEXITCODE)" }
+          $decompSec = ((Get-Date) - $tDecomp).TotalSeconds
+          Remove-Item $BaseZst -Force
+          G "boot_decompress_base" $decompSec $rawVhdMB
+
+          $tMount = Get-Date
+          New-VHD -ParentPath $BaseVhd -Path $DiffVhd -Differencing | Out-Null
+          $mimg = Mount-DiskImage -ImagePath $DiffVhd -PassThru
+          $mdisk = $mimg | Get-Disk
+          $mvol = Get-Volume | Where-Object { $_.FileSystemLabel -eq "persist" } | Select-Object -First 1
+          if ($mvol -and [string]$mvol.DriveLetter -ne "E") {
+            $mp = Get-Partition -Volume $mvol
+            Set-Partition -DiskNumber $mdisk.Number -PartitionNumber $mp.PartitionNumber -NewDriveLetter "E"
+          }
+          $mountSec = ((Get-Date) - $tMount).TotalSeconds
+          G "boot_mount_diff_vhdx" $mountSec
+          G "stageB_cold_boot_total" ((Get-Date) - $tBoot).TotalSeconds $rawVhdMB
+
+          Write-Host ("RESULT boot_e_present={0}" -f (Test-Path "E:\workspace-25gb.dat"))
+          Write-Host ("RESULT boot_25gb_size_match={0}" -f ((Get-Item "E:\workspace-25gb.dat").Length -eq $targetBytes))
+
+          # Measure native local read speed on E: (read 2GB from E:\workspace-25gb.dat)
+          $tRead = Get-Date
+          $rf = [IO.File]::Open("E:\workspace-25gb.dat", "Open", "Read", "Read")
+          $rbuf = New-Object byte[] (8MB)
+          $rgot = [long]0
+          while ($rgot -lt 2GB) {
+            $n = $rf.Read($rbuf, 0, $rbuf.Length)
+            if ($n -le 0) { break }
+            $rgot += $n
+          }
+          $rf.Close()
+          G "local_vhdx_read_speed" ((Get-Date) - $tRead).TotalSeconds ($rgot / 1MB)
+
+          # 5. STAGE C: Session Modifications (Write 500MB + new files on E:) -> Differencing VHDX Fast Shutdown Save!
+          Write-Host "=== STAGE C: INCREMENTAL SESSION SAVE VIA DIFFERENCING VHDX (500MB CHANGED ON 25GB DISK) ==="
+          $df = [IO.File]::Open("E:\session-delta-500mb.dat", "Create", "Write", "None")
+          $dw = [long]0
+          while ($dw -lt 500MB) {
+            $rnd.NextBytes($hdr)
+            [Array]::Copy($hdr, 0, $buf, 0, 64)
+            $df.Write($buf, 0, $buf.Length)
+            $dw += $buf.Length
+          }
+          $df.Close()
+          Set-Content -Path "E:\session-marker.txt" -Value "diff_session_saved_ok" -Encoding UTF8
+
+          $tDiffSave = Get-Date
+          Dismount-DiskImage -ImagePath $DiffVhd | Out-Null
+          $diffRawBytes = (Get-Item $DiffVhd).Length
+          & $zstd -q -1 -T0 -f $DiffVhd -o $DiffZst
+          if ($LASTEXITCODE -ne 0) { throw "zstd compress diff failed ($LASTEXITCODE)" }
+          $diffZstBytes = (Get-Item $DiffZst).Length
+          & $rclone copy $DiffZst $remote --s3-chunk-size 64M --s3-upload-concurrency 16 --stats 0
+          if ($LASTEXITCODE -ne 0) { throw "rclone upload diff failed ($LASTEXITCODE)" }
+          $diffSaveSec = ((Get-Date) - $tDiffSave).TotalSeconds
+          G "stageC_diff_shutdown_save_total" $diffSaveSec ($diffRawBytes / 1MB)
+          Write-Host ("RESULT diff_raw_mb={0:N1} diff_zst_mb={1:N1}" -f ($diffRawBytes / 1MB), ($diffZstBytes / 1MB))
+
+          # 6. STAGE D: Verify Reboot with Base + Diff VHDX
+          Remove-Item $DiffVhd, $DiffZst -Force
+          $tDiffBoot = Get-Date
+          & $rclone copy "$remote/diff.vhdx.zst" $WorkZst --local-no-sparse --multi-thread-streams 16 --stats 0
+          & $zstd -q -d -T0 -f $DiffZst -o $DiffVhd
+          $mimg2 = Mount-DiskImage -ImagePath $DiffVhd -PassThru
+          $mdisk2 = $mimg2 | Get-Disk
+          $mvol2 = Get-Volume | Where-Object { $_.FileSystemLabel -eq "persist" } | Select-Object -First 1
+          if ($mvol2 -and [string]$mvol2.DriveLetter -ne "E") {
+            $mp2 = Get-Partition -Volume $mvol2
+            Set-Partition -DiskNumber $mdisk2.Number -PartitionNumber $mp2.PartitionNumber -NewDriveLetter "E"
+          }
+          G "stageD_diff_restore_attach" ((Get-Date) - $tDiffBoot).TotalSeconds ($diffZstBytes / 1MB)
+          Write-Host ("RESULT reboot_base_25gb_present={0}" -f ((Get-Item "E:\workspace-25gb.dat").Length -eq $targetBytes))
+          Write-Host ("RESULT reboot_delta_500mb_present={0}" -f ((Get-Item "E:\session-delta-500mb.dat").Length -eq 500MB))
+          Write-Host ("RESULT reboot_marker_ok={0}" -f ((Get-Content "E:\session-marker.txt" -Raw).Trim() -eq "diff_session_saved_ok"))
+
+          Dismount-DiskImage -ImagePath $DiffVhd | Out-Null
+          $ErrorActionPreference = "Continue"
+          & $rclone purge $remote 2>&1 | Out-Null
+          Write-Host "VHDX_ZSTD_BENCH_DONE"
+          exit 0
