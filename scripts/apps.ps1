@@ -130,21 +130,70 @@ function Test-IsJunction([string]$path) {
   return ($i.LinkType -eq "Junction" -or $i.LinkType -eq "SymbolicLink")
 }
 
+function Get-WorkRoot {
+  if (Test-Path "D:\") { return "D:\e-disk" }
+  $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+  return (Join-Path $root "e-disk")
+}
+
+function Ensure-BootBaseline {
+  $work = Get-WorkRoot
+  New-Item -ItemType Directory -Force -Path $work | Out-Null
+  $bp = Join-Path $work "boot-baseline.json"
+  if (Test-Path $bp) {
+    try { return (Get-Content $bp -Raw | ConvertFrom-Json) } catch {}
+  }
+  $pf = @()
+  $pfx86 = @()
+  $pd = @()
+  if (Test-Path "C:\Program Files") {
+    $pf = @(Get-ChildItem "C:\Program Files" -Directory -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.LinkType -ne "Junction" -and $_.LinkType -ne "SymbolicLink" } |
+      Select-Object -ExpandProperty Name)
+  }
+  if (Test-Path "C:\Program Files (x86)") {
+    $pfx86 = @(Get-ChildItem "C:\Program Files (x86)" -Directory -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.LinkType -ne "Junction" -and $_.LinkType -ne "SymbolicLink" } |
+      Select-Object -ExpandProperty Name)
+  }
+  if (Test-Path "C:\ProgramData") {
+    $pd = @(Get-ChildItem "C:\ProgramData" -Directory -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.LinkType -ne "Junction" -and $_.LinkType -ne "SymbolicLink" } |
+      Select-Object -ExpandProperty Name)
+  }
+  $obj = [pscustomobject]@{
+    capturedAt      = [DateTime]::UtcNow.ToString("o")
+    ProgramFiles    = $pf
+    ProgramFilesX86 = $pfx86
+    ProgramData     = $pd
+  }
+  $obj | ConvertTo-Json -Depth 4 | Set-Content -Path $bp -Encoding UTF8
+  return $obj
+}
+
 function Invoke-Save {
   Set-RcloneR2Env
   if (-not (Test-Path "${Letter}:\")) { throw "apps: ${Letter}: not mounted" }
 
+  $baseline = Ensure-BootBaseline
   $entries = @(Read-Manifest)
   $byPath = @{}
   foreach ($e in $entries) { if ($e.localPath) { $byPath[$e.localPath] = $e } }
 
   foreach ($root in $Roots) {
     if (-not (Test-Path $root.Path)) { continue }
+    $baseList = if ($root.Remote -eq "ProgramFiles") { @($baseline.ProgramFiles) } else { @($baseline.ProgramFilesX86) }
     $children = Get-ChildItem $root.Path -Directory -Force -ErrorAction SilentlyContinue
     foreach ($c in $children) {
       if ($SkipNames -contains $c.Name) { continue }
       if (Test-IsJunction $c.FullName) { continue }
-      if ($env:APPS_ONLY -and $c.Name -ne $env:APPS_ONLY) { continue }
+      if ($env:APPS_ONLY) {
+        if ($c.Name -ne $env:APPS_ONLY) { continue }
+      } else {
+        if (($baseList -contains $c.Name) -and (-not $byPath.ContainsKey($c.FullName))) {
+          continue
+        }
+      }
 
       $remote = (Get-RemoteRoot) + "/$($root.Remote)/$($c.Name)"
       $t0 = Get-Date
@@ -166,7 +215,14 @@ function Invoke-Save {
         continue
       }
 
+      # Refresh rclone mount dir cache so the newly uploaded remote folder is immediately visible on E:
+      Invoke-Rclone @("rc", "vfs/forget", "--rc-addr", "127.0.0.1:5572") | Out-Null
+
       $target = Join-Path ("${Letter}:\" + $root.Remote) $c.Name
+      for ($w = 0; $w -lt 20; $w++) {
+        if (Test-Path $target) { break }
+        Start-Sleep -Milliseconds 250
+      }
       if (-not (Test-Path $target)) {
         Write-Host ("apps: remote target not visible {0}" -f $target)
         continue
@@ -209,6 +265,7 @@ function Invoke-Link {
 }
 
 function Invoke-Restore {
+  Ensure-BootBaseline | Out-Null
   Set-RcloneR2Env
   if (-not (Test-Path "${Letter}:\")) { throw "apps: ${Letter}: not mounted" }
 
