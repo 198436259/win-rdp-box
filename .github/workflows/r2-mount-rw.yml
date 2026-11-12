@@ -3,37 +3,36 @@ on: workflow_dispatch
 jobs:
   rw:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
     steps:
-      - name: mount r2 as X: and prove read+write+diff upload
+      - name: "1 install winfsp and rclone"
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          function W([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f $n) }
-          function G([string]$n, [double]$s, [double]$mb) {
-            $r = if ($s -gt 0) { $mb / $s } else { 0 }
-            Write-Host ("GAUGE {0} seconds={1:N2} MBps={2:N1}" -f $n, $s, $r)
-          }
-
-          W "0 INSTALL WINFSP + RCLONE"
           $t = Get-Date
           $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
           curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
           $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
-          Write-Host ("winfsp exit={0}" -f $p.ExitCode)
+          Write-Host ("RESULT winfsp_exit={0}" -f $p.ExitCode)
           $dir = Join-Path $env:RUNNER_TEMP "rclone"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
           curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
           Expand-Archive $zip $dir -Force
           $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
-          G "install" ((Get-Date) - $t).TotalSeconds 0
+          Write-Host ("RESULT rclone_exe={0}" -f $exe)
+          Write-Host ("GAUGE install seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
 
+      - name: "2 mount r2 prefix as X drive"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem (Join-Path $env:RUNNER_TEMP "rclone") -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
           $env:RCLONE_CONFIG_R2_TYPE = "s3"
           $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
           $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
@@ -41,12 +40,9 @@ jobs:
           $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
           $env:RCLONE_CONFIG_R2_REGION = "auto"
           $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
-
           $log = Join-Path $env:RUNNER_TEMP "mount.log"
           $cache = Join-Path $env:RUNNER_TEMP "vfscache"
           New-Item -ItemType Directory -Force -Path $cache | Out-Null
-
-          W "1 MOUNT AS X: (no VHD, files straight from R2)"
           $t = Get-Date
           $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList @(
             "mount", "r2:$($env:R2_BUCKET)/diffprobe", "X:",
@@ -55,61 +51,69 @@ jobs:
             "--log-file", $log, "--log-level", "INFO"
           )
           $up = $false
-          for ($i = 0; $i -lt 120; $i++) {
+          for ($i = 0; $i -lt 240; $i++) {
             Start-Sleep -Milliseconds 250
             if (Test-Path "X:\") { $up = $true; break }
             if ($proc.HasExited) { break }
           }
-          G "mount_to_drive_visible" ((Get-Date) - $t).TotalSeconds 0
-          Write-Host ("RESULT mount_up={0} process_alive={1}" -f $up, (-not $proc.HasExited))
-          if (-not $up) {
-            Get-Content $log -Tail 30 -ErrorAction SilentlyContinue | Out-Host
-            throw "mount did not come up"
-          }
+          Write-Host ("GAUGE mount_visible seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          Write-Host ("RESULT mount_up={0} alive={1}" -f $up, (-not $proc.HasExited))
+          if (-not $up) { Get-Content $log -Tail 40 -ErrorAction SilentlyContinue | Out-Host; throw "mount failed" }
+          $top = (Get-ChildItem "X:\" | Select-Object -ExpandProperty Name) -join ","
+          Write-Host ("RESULT top_level={0}" -f $top)
 
-          W "2 READ: list real folders (not a VHD)"
-          $top = Get-ChildItem "X:\" | Select-Object -ExpandProperty Name
-          Write-Host ("RESULT top_level=" + ($top -join ","))
-          $n = (Get-ChildItem "X:\" -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
-          Write-Host ("RESULT files_visible={0}" -f $n)
-
-          W "3 READ: pull 900MB file through the mount (first read = cold)"
+      - name: "3 cold read 900MB through mount"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
           $big = "X:\Desktop\video.mp4"
-          if (Test-Path $big) {
-            $t = Get-Date
-            $sz = (Get-Item $big).Length
-            $h = (Get-FileHash $big -Algorithm SHA256).Hash
-            $s = ((Get-Date) - $t).TotalSeconds
-            G "cold_read_900mb" $s ($sz / 1MB)
-            Write-Host ("RESULT big_sha256_prefix={0}" -f $h.Substring(0,16))
-          } else {
-            Write-Host "RESULT big_missing"
-          }
+          if (-not (Test-Path $big)) { Write-Host "RESULT big_missing"; exit 0 }
+          $t = Get-Date
+          $sz = (Get-Item $big).Length
+          $h = (Get-FileHash $big -Algorithm SHA256).Hash
+          $s = ((Get-Date) - $t).TotalSeconds
+          Write-Host ("GAUGE cold_read900 seconds={0:N2} MBps={1:N1}" -f $s, (($sz/1MB)/$s))
+          Write-Host ("RESULT big_sha_prefix={0}" -f $h.Substring(0,16))
 
-          W "4 WRITE THROUGH THE MOUNT"
+      - name: "4 write through mount"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
           $t = Get-Date
           Set-Content -Path "X:\Desktop\written-from-mount.txt" -Value ("hello from mount " + (Get-Date -Format o)) -Encoding UTF8
           $back = Get-Content "X:\Desktop\written-from-mount.txt" -Raw
           Write-Host ("RESULT write_readback_ok={0}" -f ($back -like "*hello from mount*"))
-          G "local_write" ((Get-Date) - $t).TotalSeconds 0
+          Write-Host ("GAUGE local_write seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
           Set-Content -Path "X:\Documents\doc07.txt" -Value "edited-through-mount" -Encoding UTF8
+          Write-Host "RESULT wrote_two_files"
 
-          W "5 FLUSH AND UNMOUNT"
+      - name: "5 unmount"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
           $t = Get-Date
-          & $exe rc vfs/forget --rc-addr 127.0.0.1:5572 2>&1 | Out-Null
+          Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep -Seconds 8
-          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 6
-          Remove-Item "X:\" -Force -ErrorAction SilentlyContinue
-          if (Test-Path "X:\") { & cmd.exe /c "rmdir X:" 2>&1 | Out-Null }
-          G "flush_unmount" ((Get-Date) - $t).TotalSeconds 0
+          & cmd.exe /c "rmdir X:" 2>&1 | Out-Null
           Write-Host ("RESULT unmounted={0}" -f (-not (Test-Path "X:\")))
+          Write-Host ("GAUGE flush_unmount seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
 
-          W "6 VERIFY WHAT LANDED IN R2"
-          & $exe lsl "r2:$($env:R2_BUCKET)/diffprobe/Desktop/written-from-mount.txt" 2>&1 | Out-Host
-          & $exe lsl "r2:$($env:R2_BUCKET)/diffprobe/Documents/doc07.txt" 2>&1 | Out-Host
+      - name: "6 verify what landed in r2"
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $exe = Get-ChildItem (Join-Path $env:RUNNER_TEMP "rclone") -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+          Write-Host "--- written-from-mount.txt ---"
+          & $exe cat "r2:$($env:R2_BUCKET)/diffprobe/Desktop/written-from-mount.txt" 2>&1 | Out-Host
+          Write-Host "--- doc07.txt ---"
+          & $exe cat "r2:$($env:R2_BUCKET)/diffprobe/Documents/doc07.txt" 2>&1 | Out-Host
           $cnt = (& $exe lsf "r2:$($env:R2_BUCKET)/diffprobe" --recursive 2>&1 | Measure-Object).Count
           Write-Host ("RESULT r2_object_count={0}" -f $cnt)
-
-          Get-Content $log -Tail 15 -ErrorAction SilentlyContinue | Out-Host
           Write-Host "MOUNT_RW_DONE"
