@@ -17,12 +17,13 @@ jobs:
       - name: enable rdp
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
           $pw = $env:RDP_PASS
           if (-not $pw) { $pw = "Runner123" }
-          net user runneradmin $pw | Out-Null
-          net localgroup administrators runneradmin /add 2>$null | Out-Null
-          net localgroup "Remote Desktop Users" runneradmin /add 2>$null | Out-Null
+          net user runneradmin $pw 2>&1 | Out-Host
+          net localgroup administrators runneradmin /add 2>&1 | Out-Host
+          net localgroup "Remote Desktop Users" runneradmin /add 2>&1 | Out-Host
+          $ErrorActionPreference = "Stop"
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fSingleSessionPerUser" -Value 0
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
