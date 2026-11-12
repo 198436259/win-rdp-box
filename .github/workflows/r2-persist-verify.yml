@@ -1,0 +1,123 @@
+name: r2-persist-verify
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "save = install software then persist; restore = fresh machine, verify software came back"
+        required: true
+        default: save
+        type: choice
+        options: [save, restore]
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_VHD_KEY: verify/e.vhdx
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: save round
+        if: inputs.mode == 'save'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          function G([string]$n, [double]$s, [double]$mb) {
+            $r = if ($s -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
+          }
+          Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+            Write-Host ("disk {0} used={1:N1}GB free={2:N1}GB" -f $_.Name, ($_.Used/1GB), ($_.Free/1GB))
+          }
+
+          Write-Host "########## 1 INSTALL REAL SOFTWARE ##########"
+          $ok = $false
+          try {
+            & choco install 7zip -y --no-progress 2>&1 | Out-Host
+            $ok = Test-Path "C:\Program Files\7-Zip\7z.exe"
+          } catch { Write-Host "choco failed: $_" }
+          if (-not $ok) {
+            try {
+              & winget install --id 7zip.7zip -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Out-Host
+              $ok = Test-Path "C:\Program Files\7-Zip\7z.exe"
+            } catch { Write-Host "winget failed: $_" }
+          }
+          New-Item -ItemType Directory -Force -Path "C:\Program Files\FlexPCProbe" | Out-Null
+          Set-Content -Path "C:\Program Files\FlexPCProbe\probe.txt" -Value ("installed-at=" + (Get-Date -Format o)) -Encoding UTF8
+          Set-Content -Path "$env:USERPROFILE\Desktop\persist-probe.txt" -Value "desktop-marker" -Encoding UTF8
+          Write-Host ("RESULT sevenzip_installed={0}" -f $ok)
+          Write-Host ("RESULT progfiles_free_before=" + [Math]::Round((Get-PSDrive C).Free/1GB,1))
+
+          Write-Host "########## 2 MOUNT PERSIST VOLUME FROM R2 ##########"
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+          $s = ((Get-Date) - $t).TotalSeconds
+          if (-not (Test-Path "E:\")) { throw "E: not mounted" }
+          $vol = Get-Volume -DriveLetter E
+          Write-Host ("RESULT e_drive fs={0} label={1} size={2:N1}GB" -f $vol.FileSystem, $vol.FileSystemLabel, ($vol.Size/1GB))
+          G "mount" $s 0
+
+          Write-Host "########## 3 SAVE USER + MACHINE STATE ##########"
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C" *>&1 | Out-Host
+          G "c_image_save" ((Get-Date) - $t).TotalSeconds 0
+          $m = "E:\CloudVM-C\manifest.json"
+          if (Test-Path $m) { Get-Content $m -Raw | Out-Host }
+          $mb = 0; $bytes = [int64]0
+          Get-ChildItem "E:\CloudVM-C" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $mb++; $bytes += $_.Length }
+          Write-Host ("RESULT delta files={0} bytes={1} ({2:N2} GiB)" -f $mb, $bytes, ($bytes/1GB))
+          Write-Host ("RESULT sevenzip_on_e=" + (Test-Path "E:\CloudVM-C\machine\Program Files\7-Zip\7z.exe"))
+
+          Write-Host "########## 4 UPLOAD ##########"
+          $before = $bytes
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save *>&1 | Out-Host
+          G "upload" ((Get-Date) - $t).TotalSeconds ($before/1MB)
+          Write-Host "SAVE_ROUND_DONE"
+
+      - name: restore round
+        if: inputs.mode == 'restore'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          function G([string]$n, [double]$s, [double]$mb) {
+            $r = if ($s -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
+          }
+          Write-Host ("RESULT sevenzip_preexisting=" + (Test-Path "C:\Program Files\7-Zip\7z.exe"))
+
+          Write-Host "########## 1 MOUNT PERSIST VOLUME FROM R2 ##########"
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action mount *>&1 | Out-Host
+          $sec = ((Get-Date) - $t).TotalSeconds
+          if (-not (Test-Path "E:\")) { throw "E: not mounted" }
+          $size = (Get-Item "D:\e.vhdx").Length
+          G "download" $sec ($size/1MB)
+          Write-Host ("RESULT e_is_real_ntfs={0}" -f ((Get-Volume -DriveLetter E).FileSystem -eq "NTFS"))
+          Write-Host ("RESULT e_top=" + ((Get-ChildItem "E:\" | Select-Object -ExpandProperty Name) -join ","))
+
+          Write-Host "########## 2 RESTORE USER + MACHINE STATE ##########"
+          $t = Get-Date
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action restore -TargetDir "E:\CloudVM-C" *>&1 | Out-Host
+          G "c_image_restore" ((Get-Date) - $t).TotalSeconds 0
+
+          Write-Host "########## 3 VERIFY ##########"
+          $r = @()
+          $r += "sevenzip_exe=" + (Test-Path "C:\Program Files\7-Zip\7z.exe")
+          $r += "probe_dir=" + (Test-Path "C:\Program Files\FlexPCProbe\probe.txt")
+          $r += "desktop_file=" + (Test-Path "$env:USERPROFILE\Desktop\persist-probe.txt")
+          $un = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like "*7-Zip*" } | Select-Object -First 1
+          $r += "uninstall_key=" + [bool]$un
+          if (Test-Path "C:\Program Files\7-Zip\7z.exe") {
+            $v = (& "C:\Program Files\7-Zip\7z.exe" 2>&1 | Select-Object -First 3) -join " "
+            $r += "sevenzip_run=" + ($v -replace "\s+", " ")
+          }
+          $r | ForEach-Object { Write-Host ("RESULT " + $_) }
+          $all = ((Test-Path "C:\Program Files\7-Zip\7z.exe") -and (Test-Path "C:\Program Files\FlexPCProbe\probe.txt") -and (Test-Path "$env:USERPROFILE\Desktop\persist-probe.txt") -and [bool]$un)
+          Write-Host ("RESULT all_persisted={0}" -f $all)
+          Write-Host "RESTORE_ROUND_DONE"
