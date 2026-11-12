@@ -66,12 +66,24 @@ function Get-RemoteRoot {
 }
 
 function Invoke-RcloneRc {
-  param([string[]]$RcArgs)
+  param([string[]]$RcArgs, [int]$TimeoutSec = 30)
   $exe = Get-RcloneExe
   $old = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
-    $out = & $exe rc @RcArgs --rc-addr $RcAddr --json 2>&1
+    $job = Start-Job -ScriptBlock {
+      param($exe, $args, $addr)
+      & $exe rc @args --rc-addr $addr --json 2>&1
+    } -ArgumentList $exe, $RcArgs, $RcAddr
+    $done = Wait-Job $job -Timeout $TimeoutSec
+    if (-not $done) {
+      Stop-Job $job -ErrorAction SilentlyContinue
+      Remove-Job $job -Force -ErrorAction SilentlyContinue
+      Write-Host ("e-disk: rc timed out after {0}s: {1}" -f $TimeoutSec, ($RcArgs -join " "))
+      return @()
+    }
+    $out = Receive-Job $job
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
     return @($out | Where-Object { [string]$_ -notmatch "NOTICE" })
   } finally {
     $ErrorActionPreference = $old
