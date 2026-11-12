@@ -36,6 +36,9 @@ jobs:
 
       - name: start ngrok
         shell: powershell
+        env:
+          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+          SNAPSHOT_TOKEN: ${{ secrets.SNAPSHOT_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
           $dir = Join-Path $env:RUNNER_TEMP "ngrok"
@@ -62,8 +65,24 @@ jobs:
           "PROBE_HOST=$hostName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "PROBE_PORT=$port" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+          $body = "host=$hostName`nport=$port`npass=$env:RDP_PASS`n"
+          $b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+          $pf = Join-Path $env:RUNNER_TEMP "pub.json"
+          (@{ message = "mount probe $($env:GITHUB_RUN_ID)"; content = $b } | ConvertTo-Json -Compress) |
+            Set-Content -Path $pf -Encoding utf8
+          $code = & curl.exe -sS -o NUL -w "%{http_code}" -X PUT `
+            -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
+            -H "Accept: application/vnd.github+json" `
+            -H "Content-Type: application/json" `
+            --data-binary "@$pf" `
+            "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/.box/mount-probe-$($env:GITHUB_RUN_ID).txt"
+          Write-Host "publish http=$code"
+
       - name: install winfsp and mount R2 as E
         shell: powershell
+        env:
+          SNAPSHOT_REPO: ${{ secrets.SNAPSHOT_REPO }}
+          SNAPSHOT_TOKEN: ${{ secrets.SNAPSHOT_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
           $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
@@ -103,6 +122,18 @@ jobs:
           if (Test-Path "E:\") {
             Get-ChildItem "E:\" | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
           }
+
+          $res = "session0_drive={0}" -f (Test-Path "E:\")
+          $rb = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($res + "`n"))
+          $rf = Join-Path $env:RUNNER_TEMP "res.json"
+          (@{ message = "mount probe result"; content = $rb } | ConvertTo-Json -Compress) | Set-Content -Path $rf -Encoding utf8
+          $rc = & curl.exe -sS -o NUL -w "%{http_code}" -X PUT `
+            -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
+            -H "Accept: application/vnd.github+json" `
+            -H "Content-Type: application/json" `
+            --data-binary "@$rf" `
+            "https://api.github.com/repos/$($env:SNAPSHOT_REPO)/contents/.box/mount-result-$($env:GITHUB_RUN_ID).txt"
+          Write-Host "result publish http=$rc"
 
           Write-Host "=== RDP SESSION CHECK ==="
           Write-Host "Log into RDP with the credentials above, then run in that session:"
