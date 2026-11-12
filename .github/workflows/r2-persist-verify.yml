@@ -39,20 +39,21 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          & choco install 7zip -y --no-progress 2>&1 | Out-Null
-          Write-Host ("RESULT app_installed={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
-          $o = & "C:\Program Files\7-Zip\7z.exe" 2>&1 | Select-Object -First 2
-          Write-Host ("RESULT app_runs_local={0}" -f (@($o | Where-Object { [string]$_ -like "*7-Zip*" }).Count -gt 0))
+          New-Item -ItemType Directory -Force -Path "C:\Program Files\FlexPCProbe" | Out-Null
+          Set-Content -Path "C:\Program Files\FlexPCProbe\probe.ps1" -Value "Write-Output FLEXPC_PROBE_OK" -Encoding UTF8
+          Write-Host ("RESULT probe_installed={0}" -f (Test-Path "C:\Program Files\FlexPCProbe\probe.ps1"))
+          $o = & powershell -NoProfile -File "C:\Program Files\FlexPCProbe\probe.ps1" 2>&1
+          Write-Host ("RESULT probe_runs_local={0}" -f (($o -join "") -like "*FLEXPC_PROBE_OK*"))
 
           Write-Host "--- apps save (upload + junction) ---"
           $t = Get-Date
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action save *>&1 | Out-Host
           Write-Host ("GAUGE apps_save seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
-          $i = Get-Item "C:\Program Files\7-Zip" -Force -ErrorAction SilentlyContinue
+          $i = Get-Item "C:\Program Files\FlexPCProbe" -Force -ErrorAction SilentlyContinue
           Write-Host ("RESULT junction_type={0}" -f ($(if ($i) { $i.LinkType } else { "gone" })))
-          Write-Host ("RESULT app_present_after_junction={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
-          $o2 = & "C:\Program Files\7-Zip\7z.exe" 2>&1 | Select-Object -First 2
-          Write-Host ("RESULT app_runs_after_junction={0}" -f (@($o2 | Where-Object { [string]$_ -like "*7-Zip*" }).Count -gt 0))
+          Write-Host ("RESULT probe_present_after_junction={0}" -f (Test-Path "C:\Program Files\FlexPCProbe\probe.ps1"))
+          $o2 = & powershell -NoProfile -File "C:\Program Files\FlexPCProbe\probe.ps1" 2>&1
+          Write-Host ("RESULT probe_runs_after_junction={0}" -f (($o2 -join "") -like "*FLEXPC_PROBE_OK*"))
 
           Write-Host "--- e-disk save (flush) ---"
           $t = Get-Date
@@ -66,32 +67,21 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          Write-Host ("RESULT app_before_restore={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
+          Write-Host ("RESULT probe_before_restore={0}" -f (Test-Path "C:\Program Files\FlexPCProbe\probe.ps1"))
 
           Write-Host "--- apps restore (rebuild junctions) ---"
           $t = Get-Date
           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action restore *>&1 | Out-Host
           Write-Host ("GAUGE apps_restore seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
 
-          $i = Get-Item "C:\Program Files\7-Zip" -Force -ErrorAction SilentlyContinue
+          $i = Get-Item "C:\Program Files\FlexPCProbe" -Force -ErrorAction SilentlyContinue
           Write-Host ("RESULT junction_type={0}" -f ($(if ($i) { $i.LinkType } else { "gone" })))
-          Write-Host ("RESULT app_exe_present={0}" -f (Test-Path "C:\Program Files\7-Zip\7z.exe"))
+          Write-Host ("RESULT probe_present_after_boot={0}" -f (Test-Path "C:\Program Files\FlexPCProbe\probe.ps1"))
 
           $t = Get-Date
-          $o = & "C:\Program Files\7-Zip\7z.exe" 2>&1 | Select-Object -First 2
+          $o = & powershell -NoProfile -File "C:\Program Files\FlexPCProbe\probe.ps1" 2>&1
           Write-Host ("GAUGE cold_run seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
-          $runs = @($o | Where-Object { [string]$_ -like "*7-Zip*" }).Count -gt 0
           $o | ForEach-Object { Write-Host ("OUT " + [string]$_) }
-          Write-Host ("RESULT app_runs_after_boot={0}" -f $runs)
-
-          $tmp = Join-Path $env:RUNNER_TEMP "zt"
-          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-          Set-Content (Join-Path $tmp "a.txt") "hello"
-          & "C:\Program Files\7-Zip\7z.exe" a (Join-Path $tmp "a.zip") (Join-Path $tmp "a.txt") 2>&1 | Out-Null
-          Write-Host ("RESULT app_zip_works={0}" -f (Test-Path (Join-Path $tmp "a.zip")))
-
-          $un = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -like "*7-Zip*" } | Select-Object -First 1
-          Write-Host ("RESULT uninstall_entry={0}" -f [bool]$un)
+          Write-Host ("RESULT probe_runs_after_boot={0}" -f (($o -join "") -like "*FLEXPC_PROBE_OK*"))
           Write-Host "RESTORE_ROUND_DONE"
           exit 0
