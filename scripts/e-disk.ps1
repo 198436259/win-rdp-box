@@ -148,9 +148,9 @@ function Invoke-RcloneRcWithTimeout {
 }
 
 function Invoke-Mount {
-  Save-BootBaseline
   Set-RcloneR2Env
   Install-WinFsp
+  Save-BootBaseline
   $exe = Get-RcloneExe
 
   if (Test-Path "${Letter}:\") {
