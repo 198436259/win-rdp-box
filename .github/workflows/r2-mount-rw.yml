@@ -46,9 +46,10 @@ jobs:
           $t = Get-Date
           $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList @(
             "mount", "r2:$($env:R2_BUCKET)/diffprobe", "X:",
-            "--vfs-cache-mode", "full", "--vfs-cache-dir", $cache,
+            "--vfs-cache-mode", "full", "--cache-dir", $cache,
             "--links", "--dir-cache-time", "10s",
-            "--log-file", $log, "--log-level", "INFO"
+            "--log-file", $log, "--log-level", "INFO",
+            "--rc", "--rc-addr", "127.0.0.1:5572"
           )
           $up = $false
           for ($i = 0; $i -lt 240; $i++) {
@@ -58,7 +59,13 @@ jobs:
           }
           Write-Host ("GAUGE mount_visible seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
           Write-Host ("RESULT mount_up={0} alive={1}" -f $up, (-not $proc.HasExited))
-          if (-not $up) { Get-Content $log -Tail 40 -ErrorAction SilentlyContinue | Out-Host; throw "mount failed" }
+          if (-not $up) {
+            Write-Host "--- rclone log ---"
+            Get-Content $log -Tail 60 -ErrorAction SilentlyContinue | Out-Host
+            Write-Host "--- exit code ---"
+            if ($proc.HasExited) { Write-Host ("exit=" + $proc.ExitCode) }
+            throw "mount failed"
+          }
           $top = (Get-ChildItem "X:\" | Select-Object -ExpandProperty Name) -join ","
           Write-Host ("RESULT top_level={0}" -f $top)
 
@@ -92,6 +99,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           $t = Get-Date
+          & (Get-ChildItem (Join-Path $env:RUNNER_TEMP "rclone") -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName) rc vfs/forget --rc-addr 127.0.0.1:5572 2>&1 | Out-Null
+          Start-Sleep -Seconds 10
           Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep -Seconds 8
           & cmd.exe /c "rmdir X:" 2>&1 | Out-Null
