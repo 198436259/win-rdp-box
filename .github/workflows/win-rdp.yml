@@ -77,29 +77,30 @@ jobs:
               $cfgPath = Join-Path $env:RUNNER_TEMP "frpc-$proto.toml"
               $logPath = Join-Path $env:RUNNER_TEMP "frpc-$proto.log"
               if (Test-Path $logPath) { Remove-Item $logPath -Force -ErrorAction SilentlyContinue }
-              @"
-serverAddr = "$frpServer"
-serverPort = 7000
-transport.protocol = "$proto"
-auth.method = "token"
-auth.token = "$frpToken"
-log.to = "$($logPath -replace '\\','/')"
-log.level = "info"
-
-[[proxies]]
-name = "rdp-tcp-$($env:GITHUB_RUN_ID)"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 3389
-remotePort = $frpRemotePort
-
-[[proxies]]
-name = "rdp-udp-$($env:GITHUB_RUN_ID)"
-type = "udp"
-localIP = "127.0.0.1"
-localPort = 3389
-remotePort = $frpRemotePort
-"@ | Set-Content -Path $cfgPath -Encoding UTF8
+              $cfgLines = @(
+                "serverAddr = `"$frpServer`"",
+                "serverPort = 7000",
+                "transport.protocol = `"$proto`"",
+                "auth.method = `"token`"",
+                "auth.token = `"$frpToken`"",
+                "log.to = `"$($logPath -replace '\\','/')`"",
+                "log.level = `"info`"",
+                "",
+                "[[proxies]]",
+                "name = `"rdp-tcp-$($env:GITHUB_RUN_ID)`"",
+                "type = `"tcp`"",
+                "localIP = `"127.0.0.1`"",
+                "localPort = 3389",
+                "remotePort = $frpRemotePort",
+                "",
+                "[[proxies]]",
+                "name = `"rdp-udp-$($env:GITHUB_RUN_ID)`"",
+                "type = `"udp`"",
+                "localIP = `"127.0.0.1`"",
+                "localPort = 3389",
+                "remotePort = $frpRemotePort"
+              )
+              [IO.File]::WriteAllText($cfgPath, ($cfgLines -join "`n"))
 
               $p = Start-Process -FilePath $frpc -ArgumentList @("-c", $cfgPath) -PassThru -WindowStyle Hidden
               for ($w = 0; $w -lt 16; $w++) {
