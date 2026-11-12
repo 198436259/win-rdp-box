@@ -243,6 +243,12 @@ function Invoke-Mount {
   $targetVhd = if (Test-Path $DiffVhd) { $DiffVhd } else { $BaseVhd }
   $tMnt = Get-Date
   Mount-VhdAsDrive -VhdPath $targetVhd -DriveLetter $Letter
+  # Reset $RECYCLE.BIN on E: so cross-machine runner SID differences never trigger
+  # "The Recycle Bin on E:\ is corrupted" popup in RDP Explorer.
+  $oldEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  & cmd.exe /c "rd /s /q ${Letter}:\`$RECYCLE.BIN" 2>$null | Out-Null
+  $ErrorActionPreference = $oldEap
   $mntSec = ((Get-Date) - $tMnt).TotalSeconds
   $totSec = ((Get-Date) - $tBoot).TotalSeconds
   $up = Test-Path "${Letter}:\"
@@ -258,6 +264,10 @@ function Invoke-Save {
   $tSave = Get-Date
 
   if (Test-Path "${Letter}:\") {
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & cmd.exe /c "rd /s /q ${Letter}:\`$RECYCLE.BIN" 2>$null | Out-Null
+    $ErrorActionPreference = $oldEap
     try { Write-VolumeCache -DriveLetter $Letter -ErrorAction SilentlyContinue } catch {}
   }
 
