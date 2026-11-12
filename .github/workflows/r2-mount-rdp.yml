@@ -68,8 +68,8 @@ jobs:
           $body = "host=$hostName`nport=$port`npass=$env:RDP_PASS`n"
           $b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
           $pf = Join-Path $env:RUNNER_TEMP "pub.json"
-          (@{ message = "mount probe $($env:GITHUB_RUN_ID)"; content = $b } | ConvertTo-Json -Compress) |
-            Set-Content -Path $pf -Encoding utf8
+          $json1 = (@{ message = "mount probe $($env:GITHUB_RUN_ID)"; content = $b } | ConvertTo-Json -Compress)
+          [IO.File]::WriteAllText($pf, $json1, (New-Object Text.UTF8Encoding($false)))
           $code = & curl.exe -sS -o NUL -w "%{http_code}" -X PUT `
             -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
             -H "Accept: application/vnd.github+json" `
@@ -126,7 +126,8 @@ jobs:
           $res = "session0_drive={0}" -f (Test-Path "E:\")
           $rb = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($res + "`n"))
           $rf = Join-Path $env:RUNNER_TEMP "res.json"
-          (@{ message = "mount probe result"; content = $rb } | ConvertTo-Json -Compress) | Set-Content -Path $rf -Encoding utf8
+          $json2 = (@{ message = "mount probe result"; content = $rb } | ConvertTo-Json -Compress)
+          [IO.File]::WriteAllText($rf, $json2, (New-Object Text.UTF8Encoding($false)))
           $rc = & curl.exe -sS -o NUL -w "%{http_code}" -X PUT `
             -H "Authorization: Bearer $($env:SNAPSHOT_TOKEN)" `
             -H "Accept: application/vnd.github+json" `
