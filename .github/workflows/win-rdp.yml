@@ -30,14 +30,25 @@ jobs:
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0
           New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force | Out-Null
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "UserAuthentication" -Value 0
+          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          Set-ItemProperty -Path $tsPol -Name "UserAuthentication" -Value 0 -Type DWord
+          Set-ItemProperty -Path $tsPol -Name "fEnableWinStation" -Value 1 -Type DWord
+          Set-ItemProperty -Path $tsPol -Name "AVC444ModePreferred" -Value 1 -Type DWord
+          Set-ItemProperty -Path $tsPol -Name "AVCHardwareEncodePreferred" -Value 1 -Type DWord
+          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 5 -Type DWord
+          Set-ItemProperty -Path $tsPol -Name "MaxCompressionLevel" -Value 2 -Type DWord
+          Set-ItemProperty -Path $tsPol -Name "VisualExperiencePolicy" -Value 1 -Type DWord
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 0 -Type DWord
+          Set-ItemProperty -Path $tsPol -Name "fServerEnableRDP8" -Value 1 -Type DWord
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations" -Name "DWMFRAMEINTERVAL" -Value 15 -Type DWord
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          New-NetFirewallRule -DisplayName "RDP-3389-in" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName "RDP-3389-TCP-in" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName "RDP-3389-UDP-in" -Direction Inbound -Protocol UDP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
           Set-Service -Name TermService -StartupType Automatic
           Restart-Service TermService -Force
           Start-Sleep -Seconds 3
           netstat -an | findstr ":3389"
-          Write-Host "rdp enabled nla=off securitylayer=rdp"
+          Write-Host "rdp enabled nla=off 60fps=on avc444=on tcp+udp=3389"
 
       - name: start ngrok tcp 3389
         shell: powershell
@@ -210,7 +221,7 @@ jobs:
           $deadline = (Get-Date).AddMinutes(350)
           $nextSave = (Get-Date).AddMinutes(60)
           while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 60
+            Start-Sleep -Seconds 15
             $cmdText = ""
             try {
               $out = powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action get -RelPath ".box/cmd" 2>&1 |
