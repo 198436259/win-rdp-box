@@ -120,7 +120,7 @@ function Invoke-Mount {
     "mount", (Get-RemoteRoot), "${Letter}:",
     "--vfs-cache-mode", "full",
     "--cache-dir", $CacheDir,
-    "--vfs-cache-max-size", "20G",
+    "--vfs-cache-max-size", "40G",
     "--links",
     "--dir-cache-time", "10s",
     "--transfers", "16",
@@ -191,28 +191,20 @@ function Invoke-Save {
     throw "e-disk: uploads did not finish, refusing to unmount"
   }
 
-  Invoke-RcloneRcWithTimeout -RcArgs @("mount/unmount", "mountPoint=${Letter}:") -TimeoutSec 120 | Out-Null
+  # rc mount/unmount never releases a WinFsp drive in our tests; killing the
+  # process is safe once every upload has drained to R2.
+  Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
   $gone = $false
-  for ($i = 0; $i -lt 240; $i++) {
+  for ($i = 0; $i -lt 60; $i++) {
     Start-Sleep -Milliseconds 250
     if (-not (Test-Path "${Letter}:\")) { $gone = $true; break }
   }
   if (-not $gone) {
-    Write-Host "e-disk: unmount did not release the drive, retrying once"
-    Invoke-RcloneRcWithTimeout -RcArgs @("mount/unmount", "mountPoint=${Letter}:") -TimeoutSec 120 | Out-Null
-    for ($i = 0; $i -lt 240; $i++) {
-      Start-Sleep -Milliseconds 250
-      if (-not (Test-Path "${Letter}:\")) { $gone = $true; break }
-    }
-  }
-  if (-not $gone) {
-    Write-Host "e-disk: drive still mounted after uploads drained, stopping process"
-    Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 5
     $old = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     & cmd.exe /c "rmdir ${Letter}:" 2>&1 | Out-Null
     $ErrorActionPreference = $old
+    Start-Sleep -Seconds 2
     $gone = -not (Test-Path "${Letter}:\")
   }
   Write-Host ("e-disk: unmounted={0} seconds={1:N2}" -f $gone, ((Get-Date) - $t0).TotalSeconds)
