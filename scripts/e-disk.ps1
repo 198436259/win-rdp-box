@@ -72,7 +72,8 @@ function Invoke-RcloneRc {
   $old = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
-    $out = & $exe rc @RcArgs --rc-addr $RcAddr --json 2>&1
+    # rc prints JSON by default; --json means INPUT json and errors if bare.
+    $out = & $exe rc @RcArgs --rc-addr $RcAddr 2>&1
     return @($out | Where-Object { [string]$_ -notmatch "NOTICE" })
   } finally {
     $ErrorActionPreference = $old
@@ -85,7 +86,7 @@ function Invoke-RcloneRcWithTimeout {
   $exe = Get-RcloneExe
   $outFile = Join-Path $Work "rc-out.txt"
   if (Test-Path $outFile) { Remove-Item $outFile -Force -ErrorAction SilentlyContinue }
-  $argLine = (@("rc") + $RcArgs + @("--rc-addr", $RcAddr, "--json")) -join " "
+  $argLine = (@("rc") + $RcArgs + @("--rc-addr", $RcAddr)) -join " "
   $p = Start-Process -FilePath $exe -ArgumentList $argLine -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput $outFile -RedirectStandardError "$outFile.err"
   $done = $p.WaitForExit($TimeoutSec * 1000)
