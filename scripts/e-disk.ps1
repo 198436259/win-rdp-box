@@ -135,6 +135,34 @@ function Invoke-Mount {
   }
 }
 
+function Wait-VfsDrained {
+  param([int]$TimeoutSec = 2400)
+  $t0 = Get-Date
+  $lastLog = -1
+  while ($true) {
+    $json = (Invoke-RcloneRc -RcArgs @("vfs/stats") -TimeoutSec 20) -join ""
+    $pending = -1
+    $inflight = -1
+    if ($json -match '"pendingUploads"\s*:\s*(\d+)') { $pending = [int]$Matches[1] }
+    if ($json -match '"uploadsInProgress"\s*:\s*(\d+)') { $inflight = [int]$Matches[1] }
+    if ($pending -eq 0 -and $inflight -eq 0) { return $true }
+    if ($pending -lt 0 -and $inflight -lt 0) {
+      Write-Host "e-disk: vfs/stats unreadable, cannot confirm drain"
+      return $false
+    }
+    $el = [int]((Get-Date) - $t0).TotalSeconds
+    if ($el -gt $TimeoutSec) {
+      Write-Host ("e-disk: drain timeout pending={0} inflight={1} elapsed={2}s" -f $pending, $inflight, $el)
+      return $false
+    }
+    if ([Math]::Floor($el / 15) -ne $lastLog) {
+      $lastLog = [Math]::Floor($el / 15)
+      Write-Host ("e-disk: draining pending={0} inflight={1} elapsed={2}s" -f $pending, $inflight, $el)
+    }
+    Start-Sleep -Seconds 2
+  }
+}
+
 function Invoke-Save {
   Set-RcloneR2Env
   if (-not (Test-Path "${Letter}:\")) {
@@ -142,10 +170,15 @@ function Invoke-Save {
     return
   }
 
-  Write-Host "e-disk: flushing pending writes"
-  Invoke-RcloneRc @("vfs/forget") | Out-Null
-
+  Write-Host "e-disk: waiting for pending uploads to finish"
   $t0 = Get-Date
+  $drained = Wait-VfsDrained -TimeoutSec 2400
+  Write-Host ("e-disk: drained={0} seconds={1:N1}" -f $drained, ((Get-Date) - $t0).TotalSeconds)
+  if (-not $drained) {
+    # Killing rclone here loses pending writes; fail loudly instead.
+    throw "e-disk: uploads did not finish, refusing to unmount"
+  }
+
   Invoke-RcloneRc @("mount/unmount", "mountPoint=${Letter}:") | Out-Null
   $gone = $false
   for ($i = 0; $i -lt 240; $i++) {
@@ -153,7 +186,15 @@ function Invoke-Save {
     if (-not (Test-Path "${Letter}:\")) { $gone = $true; break }
   }
   if (-not $gone) {
-    Write-Host "e-disk: graceful unmount timed out, stopping process"
+    Write-Host "e-disk: unmount did not release the drive, retrying once"
+    Invoke-RcloneRc @("mount/unmount", "mountPoint=${Letter}:") | Out-Null
+    for ($i = 0; $i -lt 240; $i++) {
+      Start-Sleep -Milliseconds 250
+      if (-not (Test-Path "${Letter}:\")) { $gone = $true; break }
+    }
+  }
+  if (-not $gone) {
+    Write-Host "e-disk: drive still mounted after uploads drained, stopping process"
     Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 5
     $old = $ErrorActionPreference
