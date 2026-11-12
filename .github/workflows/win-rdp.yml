@@ -50,24 +50,96 @@ jobs:
           netstat -an | findstr ":3389"
           Write-Host "rdp enabled nla=off 60fps=on avc444=on tcp+udp=3389"
 
-      - name: start ngrok tcp 3389
+      - name: start tunnel (frp quic+udp or ngrok)
         shell: powershell
         env:
+          FRP_SERVER: ${{ secrets.FRP_SERVER }}
+          FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+          FRP_REMOTE_PORT: ${{ secrets.FRP_REMOTE_PORT }}
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
-          if (-not $env:NGROK_AUTHTOKEN) { throw "NGROK_AUTHTOKEN secret missing" }
-          $zip = Join-Path $env:RUNNER_TEMP "ngrok.zip"
-          $dir = Join-Path $env:RUNNER_TEMP "ngrok"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          curl.exe -fsSL -o $zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          if (-not (Test-Path $zip) -or ((Get-Item $zip).Length -lt 1000000)) { throw "ngrok zip download failed" }
-          Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $ngrok = Join-Path $dir "ngrok.exe"
-          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
-          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
-          Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
-          Write-Host "ngrok started in background"
+          $frpServer = ([string]$env:FRP_SERVER).Trim()
+          $frpToken = if ($env:FRP_TOKEN) { ([string]$env:FRP_TOKEN).Trim() } else { "FlexPC_2026_RdpQuic" }
+          $frpRemotePort = if ($env:FRP_REMOTE_PORT) { [int]$env:FRP_REMOTE_PORT } else { 20001 }
+          $frpConnected = $false
+
+          if ($frpServer) {
+            Write-Host "trying frp relay server=$frpServer remotePort=$frpRemotePort"
+            $frpZip = Join-Path $env:RUNNER_TEMP "frp.zip"
+            $frpDir = Join-Path $env:RUNNER_TEMP "frp"
+            New-Item -ItemType Directory -Force -Path $frpDir | Out-Null
+            curl.exe -fsSL -o $frpZip "https://github.com/fatedier/frp/releases/download/v0.61.1/frp_0.61.1_windows_amd64.zip"
+            Expand-Archive -Path $frpZip -DestinationPath $frpDir -Force
+            $frpc = Get-ChildItem -Path $frpDir -Recurse -Filter "frpc.exe" | Select-Object -First 1 -ExpandProperty FullName
+
+            foreach ($proto in @("quic", "tcp")) {
+              $cfgPath = Join-Path $env:RUNNER_TEMP "frpc-$proto.toml"
+              $logPath = Join-Path $env:RUNNER_TEMP "frpc-$proto.log"
+              if (Test-Path $logPath) { Remove-Item $logPath -Force -ErrorAction SilentlyContinue }
+              @"
+serverAddr = "$frpServer"
+serverPort = 7000
+transport.protocol = "$proto"
+auth.method = "token"
+auth.token = "$frpToken"
+log.to = "$($logPath -replace '\\','/')"
+log.level = "info"
+
+[[proxies]]
+name = "rdp-tcp-$($env:GITHUB_RUN_ID)"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 3389
+remotePort = $frpRemotePort
+
+[[proxies]]
+name = "rdp-udp-$($env:GITHUB_RUN_ID)"
+type = "udp"
+localIP = "127.0.0.1"
+localPort = 3389
+remotePort = $frpRemotePort
+"@ | Set-Content -Path $cfgPath -Encoding UTF8
+
+              $p = Start-Process -FilePath $frpc -ArgumentList @("-c", $cfgPath) -PassThru -WindowStyle Hidden
+              for ($w = 0; $w -lt 16; $w++) {
+                Start-Sleep -Milliseconds 500
+                if (Test-Path $logPath) {
+                  $txt = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
+                  if ($txt -match "start proxy success") {
+                    $frpConnected = $true
+                    "TUNNEL_MODE=frp-$proto" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                    "TUNNEL_HOST=$frpServer" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                    "TUNNEL_PORT=$frpRemotePort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                    Write-Host "frp connected mode=frp-$proto host=$frpServer port=$frpRemotePort (TCP+UDP 3389)"
+                    break
+                  }
+                }
+              }
+              if ($frpConnected) { break }
+              try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+              if (Test-Path $logPath) {
+                Write-Host "frp ($proto) log:"
+                Get-Content $logPath -ErrorAction SilentlyContinue | Out-Host
+              }
+            }
+          }
+
+          if (-not $frpConnected) {
+            if (-not $env:NGROK_AUTHTOKEN) { throw "Neither FRP_SERVER connected nor NGROK_AUTHTOKEN secret available" }
+            $zip = Join-Path $env:RUNNER_TEMP "ngrok.zip"
+            $dir = Join-Path $env:RUNNER_TEMP "ngrok"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            curl.exe -fsSL -o $zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+            if (-not (Test-Path $zip) -or ((Get-Item $zip).Length -lt 1000000)) { throw "ngrok zip download failed" }
+            Expand-Archive -Path $zip -DestinationPath $dir -Force
+            $ngrok = Join-Path $dir "ngrok.exe"
+            & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+            $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+            Start-Process -FilePath $ngrok -ArgumentList @("tcp","3389","--region","jp","--log",$log) -WindowStyle Hidden
+            "TUNNEL_MODE=ngrok" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "ngrok started in background"
+          }
 
       - name: publish connect info
         shell: powershell
@@ -78,32 +150,39 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           if (-not $env:SNAPSHOT_REPO) { $env:SNAPSHOT_REPO = $env:GITHUB_REPOSITORY }
-          $pub = $null
-          $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
-          for ($i = 0; $i -lt 40; $i++) {
-            try {
-              $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
-              foreach ($t in @($j.tunnels)) {
-                $u = [string]$t.public_url
-                if ($u -match "^tcp://") { $pub = $u; break }
-              }
-            } catch {}
-            if ($pub) { break }
-            Start-Sleep -Seconds 3
-          }
           $status = "ready"
           $rdpHost = ""
           $rdpPort = ""
-          if (-not $pub) {
-            $status = "ngrok-no-url"
-            if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 40 }
-          } elseif ($pub -match "tcp://([^:]+):(\d+)") {
-            $rdpHost = $Matches[1]
-            $rdpPort = $Matches[2]
+          $pub = ""
+
+          if ($env:TUNNEL_MODE -like "frp-*") {
+            $rdpHost = $env:TUNNEL_HOST
+            $rdpPort = $env:TUNNEL_PORT
+            $pub = "$($env:TUNNEL_MODE)://${rdpHost}:${rdpPort}"
           } else {
-            $status = "ngrok-bad-url"
+            $log = Join-Path $env:RUNNER_TEMP "ngrok.log"
+            for ($i = 0; $i -lt 40; $i++) {
+              try {
+                $j = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
+                foreach ($t in @($j.tunnels)) {
+                  $u = [string]$t.public_url
+                  if ($u -match "^tcp://") { $pub = $u; break }
+                }
+              } catch {}
+              if ($pub) { break }
+              Start-Sleep -Seconds 3
+            }
+            if (-not $pub) {
+              $status = "ngrok-no-url"
+              if (Test-Path $log) { Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 40 }
+            } elseif ($pub -match "tcp://([^:]+):(\d+)") {
+              $rdpHost = $Matches[1]
+              $rdpPort = $Matches[2]
+            } else {
+              $status = "ngrok-bad-url"
+            }
           }
-          Write-Host "tunnel status=$status host=$rdpHost port=$rdpPort"
+          Write-Host "tunnel status=$status mode=$($env:TUNNEL_MODE) host=$rdpHost port=$rdpPort"
           $body = "status=$status`nhost=$rdpHost`nport=$rdpPort`npass=$env:RDP_PASS`nurl=$pub`n"
           $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
           $path = ".box/$($env:GITHUB_RUN_ID).txt"
