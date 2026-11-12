@@ -142,6 +142,13 @@ jobs:
             if ($logText.Length -gt 15000) { $logText = $logText.Substring($logText.Length - 15000) }
             powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\box-mail.ps1 -Action put -RelPath ".box/e-mount.log" -Content $logText
           }
+          if (Test-Path "E:\") {
+            try {
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action restore *>&1 | Out-Host
+            } catch {
+              Write-Host "apps restore failed: $_"
+            }
+          }
           $delta = "E:\CloudVM-C"
           try {
             if ((Test-Path $delta) -and (Test-Path "$delta\manifest.json")) {
@@ -214,6 +221,7 @@ jobs:
               }
               try {
                 if (Test-Path "E:\") {
+                  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action save *>&1 | Out-Host
                   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C"
                 } else {
                   throw "E: not mounted"
@@ -239,6 +247,7 @@ jobs:
               Write-Host "periodic save $((Get-Date).ToString('o'))"
               try {
                 if (Test-Path "E:\") {
+                  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action save *>&1 | Out-Host
                   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C"
                 }
               } catch {
@@ -250,6 +259,7 @@ jobs:
           Write-Host "auto-save before timeout"
           try {
             if (Test-Path "E:\") {
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apps.ps1 -Action save *>&1 | Out-Host
               powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\c-image.ps1 -Action save -TargetDir "E:\CloudVM-C"
               powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\e-disk.ps1 -Action save
             }
