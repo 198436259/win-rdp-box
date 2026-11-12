@@ -1,0 +1,105 @@
+name: r2-compress
+on: workflow_dispatch
+jobs:
+  compress:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: compression ratio of real user data + upload concurrency
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          function W([string]$n) { Write-Host ""; Write-Host ("########## {0} ##########" -f $n) }
+
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          $root = "D:\comp"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $vhd = Join-Path $root "e.vhdx"
+
+          W "1 DOWNLOAD VHD"
+          $t = Get-Date
+          & $exe copy "r2:$($env:R2_BUCKET)/e.vhdx" $root --local-no-sparse --multi-thread-streams 16 --stats 0
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          Write-Host ("RESULT download seconds={0:N1} MBps={1:N1}" -f ((Get-Date) - $t).TotalSeconds, (((Get-Item $vhd).Length / 1MB) / ((Get-Date) - $t).TotalSeconds))
+
+          W "2 MOUNT"
+          $img = Mount-DiskImage -ImagePath $vhd -PassThru -ErrorAction Stop
+          Start-Sleep -Seconds 2
+          try { Update-HostStorageCache } catch {}
+          $disk = $img | Get-Disk
+          $vol = Get-Volume | Where-Object { $_.FileSystemLabel -eq "persist" } | Select-Object -First 1
+          if (-not $vol) { throw "no persist volume" }
+          if ([string]$vol.DriveLetter -ne "E") {
+            $p = Get-Partition -Volume $vol
+            Set-Partition -DiskNumber $disk.Number -PartitionNumber $p.PartitionNumber -NewDriveLetter "E"
+            Start-Sleep -Seconds 2
+          }
+
+          $raw = [long]0
+          $files = 0
+          Get-ChildItem "E:\CloudVM-C" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $files++; $raw += $_.Length }
+          Write-Host ("RESULT userdata files={0} raw_bytes={1} ({2:N2} GiB)" -f $files, $raw, ($raw / 1GB))
+
+          W "3 FETCH ZSTD"
+          $zdir = Join-Path $env:RUNNER_TEMP "zstd"
+          New-Item -ItemType Directory -Force -Path $zdir | Out-Null
+          $zzip = Join-Path $env:RUNNER_TEMP "zstd.zip"
+          curl.exe -fsSL -o $zzip "https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-v1.5.6-win64.zip"
+          Expand-Archive $zzip $zdir -Force
+          $zstd = (Get-ChildItem $zdir -Recurse -Filter zstd.exe | Select-Object -First 1).FullName
+          Write-Host ("zstd={0}" -f (& $zstd --version))
+
+          W "4 COMPRESS USERDATA (level 3)"
+          $out3 = Join-Path $root "userdata-z3.tar.zst"
+          $t = Get-Date
+          Push-Location "E:\"
+          & tar.exe -cf - CloudVM-C | & $zstd -3 -q -o $out3 -f
+          Pop-Location
+          $s3 = ((Get-Date) - $t).TotalSeconds
+          $b3 = (Get-Item $out3).Length
+          Write-Host ("RESULT zstd3 bytes={0} ratio={1:P1} seconds={2:N1} MBps={3:N1}" -f $b3, ($b3 / $raw), $s3, (($raw / 1MB) / $s3))
+
+          W "5 COMPRESS USERDATA (level 19)"
+          $out19 = Join-Path $root "userdata-z19.tar.zst"
+          $t = Get-Date
+          Push-Location "E:\"
+          & tar.exe -cf - CloudVM-C | & $zstd -19 -q -T0 -o $out19 -f
+          Pop-Location
+          $s19 = ((Get-Date) - $t).TotalSeconds
+          $b19 = (Get-Item $out19).Length
+          Write-Host ("RESULT zstd19 bytes={0} ratio={1:P1} seconds={2:N1} MBps={3:N1}" -f $b19, ($b19 / $raw), $s19, (($raw / 1MB) / $s19))
+
+          W "6 UPLOAD CONCURRENCY SWEEP (zstd3 artifact)"
+          foreach ($c in @(4, 16, 32)) {
+            $t = Get-Date
+            & $exe copy $out3 "r2:$($env:R2_BUCKET)/tune/c$c/" --s3-chunk-size 64M --s3-upload-concurrency $c --stats 0
+            if ($LASTEXITCODE -ne 0) { throw "upload failed at c=$c" }
+            $s = ((Get-Date) - $t).TotalSeconds
+            Write-Host ("RESULT upconc{0} seconds={1:N1} MBps={2:N1}" -f $c, $s, (($b3 / 1MB) / $s))
+          }
+
+          W "7 CLEANUP"
+          $old = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          & $exe purge "r2:$($env:R2_BUCKET)/tune/" 2>&1 | Out-Host
+          $ErrorActionPreference = $old
+          Write-Host "COMPRESS_DONE"
