@@ -1,0 +1,96 @@
+name: r2-size25-shutdown
+on: workflow_dispatch
+jobs:
+  shut:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+    steps:
+      - name: mount, change, unmount, measure
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          function G([string]$n, [double]$s, [double]$mb) {
+            $r = if ($s -gt 0) { $mb / $s } else { 0 }
+            Write-Host ("GAUGE {0} seconds={1:N1} MBps={2:N1}" -f $n, $s, $r)
+          }
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
+          curl.exe -fsSL -o $msi "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          Write-Host ("RESULT winfsp_exit={0}" -f $p.ExitCode)
+          $dir = Join-Path $env:RUNNER_TEMP "rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "rclone.zip"
+          curl.exe -fsSL -o $zip "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive $zip $dir -Force
+          $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1 -ExpandProperty FullName
+          $env:RCLONE_CONFIG_R2_TYPE = "s3"
+          $env:RCLONE_CONFIG_R2_PROVIDER = "Cloudflare"
+          $env:RCLONE_CONFIG_R2_ACCESS_KEY_ID = $env:R2_ACCESS_KEY_ID
+          $env:RCLONE_CONFIG_R2_SECRET_ACCESS_KEY = $env:R2_SECRET_ACCESS_KEY
+          $env:RCLONE_CONFIG_R2_ENDPOINT = $env:R2_ENDPOINT
+          $env:RCLONE_CONFIG_R2_REGION = "auto"
+          $env:RCLONE_CONFIG_R2_NO_CHECK_BUCKET = "true"
+
+          $cache = Join-Path $env:RUNNER_TEMP "vfscache"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $log = Join-Path $env:RUNNER_TEMP "mount.log"
+          $t = Get-Date
+          $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -ArgumentList @(
+            "mount", "r2:$($env:R2_BUCKET)/size25", "E:",
+            "--vfs-cache-mode", "full", "--cache-dir", $cache,
+            "--links", "--dir-cache-time", "10s", "--transfers", "16",
+            "--file-perms", "0777", "--dir-perms", "0777",
+            "--rc", "--rc-addr", "127.0.0.1:5572",
+            "--log-file", $log, "--log-level", "INFO"
+          )
+          for ($i = 0; $i -lt 240; $i++) { Start-Sleep -Milliseconds 250; if (Test-Path "E:\") { break } }
+          Write-Host ("GAUGE mount_visible seconds={0:N2}" -f ((Get-Date) - $t).TotalSeconds)
+          Write-Host ("RESULT mounted={0}" -f (Test-Path "E:\"))
+
+          $t = Get-Date
+          $delta = Join-Path $env:RUNNER_TEMP "delta.bin"
+          $buf = New-Object byte[] (8MB)
+          [Random]::new(9).NextBytes($buf)
+          $fs = [IO.File]::Open($delta, "Create", "Write", "None")
+          $need = [long](200MB)
+          $w = [long]0
+          while ($w -lt $need) { $c = [int][Math]::Min([long]$buf.Length, ($need - $w)); $fs.Write($buf, 0, $c); $w += $c }
+          $fs.Close()
+          Copy-Item $delta "E:\delta.bin" -Force
+          Set-Content -Path "E:\session-note.txt" -Value "saved this session" -Encoding UTF8
+          Write-Host ("GAUGE write_delta seconds={0:N1}" -f ((Get-Date) - $t).TotalSeconds)
+
+          Write-Host "--- flush via rc ---"
+          $t = Get-Date
+          $rcJob = Start-Job -ScriptBlock {
+            param($exe, $addr)
+            & $exe rc vfs/forget --rc-addr $addr 2>&1 | Out-Null
+            & $exe rc mount/unmount mountPoint="E:" --rc-addr $addr 2>&1 | Out-Null
+          } -ArgumentList $exe, "127.0.0.1:5572"
+          $done = Wait-Job $rcJob -Timeout 40
+          if (-not $done) { Stop-Job $rcJob -ErrorAction SilentlyContinue; Write-Host "RESULT rc_unmount=timed_out" } else { Write-Host "RESULT rc_unmount=returned" }
+          Remove-Job $rcJob -Force -ErrorAction SilentlyContinue
+
+          if (Test-Path "E:\") {
+            Get-Process rclone -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 6
+            & cmd.exe /c "rmdir E:" 2>&1 | Out-Null
+          }
+          $flushSec = ((Get-Date) - $t).TotalSeconds
+          Write-Host ("GAUGE flush_unmount seconds={0:N1}" -f $flushSec)
+          Write-Host ("RESULT unmounted={0}" -f (-not (Test-Path "E:\")))
+
+          Write-Host "--- verify what landed ---"
+          $d = (& $exe lsl "r2:$($env:R2_BUCKET)/size25/delta.bin" 2>&1 | Out-String)
+          Write-Host ("RESULT delta_in_r2={0}" -f ($d -match "delta.bin"))
+          $n = (& $exe cat "r2:$($env:R2_BUCKET)/size25/session-note.txt" 2>&1 | Out-String)
+          Write-Host ("RESULT note_in_r2={0}" -f ($n -like "*saved this session*"))
+          & $exe delete "r2:$($env:R2_BUCKET)/size25/delta.bin" 2>&1 | Out-Null
+          & $exe delete "r2:$($env:R2_BUCKET)/size25/session-note.txt" 2>&1 | Out-Null
+          Write-Host "SHUTDOWN_DONE"
+          exit 0
